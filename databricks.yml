@@ -1,5 +1,6 @@
 # Declarative Automation Bundle (formerly "Databricks Asset Bundle").
-# Defines the Unity Catalog schemas, the landing volume and the pipeline job as code.
+# Defines the Unity Catalog schemas, the landing volume, the pipeline job and the
+# AI/BI dashboard as code.
 # The workspace host is not committed: pass it through a CLI profile, e.g.
 #   databricks bundle deploy -p <profile>
 bundle:
@@ -9,6 +10,10 @@ variables:
   catalog:
     description: Unity Catalog catalog (Free Edition provides "workspace")
     default: workspace
+  warehouse_id:
+    description: SQL warehouse for the dashboard (Free Edition provides one)
+    lookup:
+      warehouse: Serverless Starter Warehouse
 
 resources:
   schemas:
@@ -32,6 +37,15 @@ resources:
       name: landing
       volume_type: MANAGED
       comment: Raw CSV files uploaded with the Databricks CLI
+
+  dashboards:
+    retail_sales:
+      display_name: Online Retail Sales
+      file_path: ./dashboards/retail_sales.lvdash.json
+      warehouse_id: ${var.warehouse_id}
+      # Dataset queries use bare table names; the bundle supplies catalog and schema.
+      dataset_catalog: ${var.catalog}
+      dataset_schema: ${resources.schemas.gold.name}
 
   jobs:
     retail_medallion_pipeline:

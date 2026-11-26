@@ -1,0 +1,507 @@
+{
+  "datasets": [
+    {
+      "name": "ds_sales",
+      "displayName": "Monthly sales by country",
+      "queryLines": [
+        "SELECT to_date(year_month || '-01') AS month, country_name, gross_sales, ",
+        "cancelled_amount, net_revenue, invoices ",
+        "FROM agg_monthly_revenue_by_country"
+      ],
+      "columns": [
+        {
+          "displayName": "Cancellation Rate",
+          "description": "Amount on cancellation invoices / gross sales",
+          "expression": "-SUM(`cancelled_amount`) / SUM(`gross_sales`)"
+        }
+      ]
+    },
+    {
+      "name": "ds_top_products",
+      "displayName": "Top 10 products",
+      "queryLines": [
+        "SELECT lpad(revenue_rank, 2, '0') || '  ' || description AS product_label, net_revenue ",
+        "FROM agg_top_products WHERE revenue_rank <= 10 ORDER BY revenue_rank"
+      ]
+    },
+    {
+      "name": "ds_countries",
+      "displayName": "Top 15 countries",
+      "queryLines": [
+        "SELECT lpad(row_number() OVER (ORDER BY sum(net_revenue) DESC), 2, '0') || '  ' || country_name AS country_label, ",
+        "sum(net_revenue) AS net_revenue ",
+        "FROM agg_monthly_revenue_by_country GROUP BY country_name ",
+        "ORDER BY net_revenue DESC LIMIT 15"
+      ]
+    }
+  ],
+  "pages": [
+    {
+      "name": "overview",
+      "displayName": "Overview",
+      "pageType": "PAGE_TYPE_CANVAS",
+      "layoutVersion": "GRID_V1",
+      "layout": [
+        {
+          "widget": {
+            "name": "title",
+            "multilineTextboxSpec": {
+              "lines": [
+                "# Online Retail Sales, Dec 2009 to Dec 2011\n",
+                "\n",
+                "Gold layer of the Medallion pipeline (UCI Online Retail II, CC BY 4.0). ",
+                "Amounts in GBP. The source ends on 2011-12-09, so December 2011 is a partial month."
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 12,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "kpi_net_revenue",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_sales",
+                  "fields": [
+                    {
+                      "name": "sum(net_revenue)",
+                      "expression": "SUM(`net_revenue`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(net_revenue)",
+                  "displayName": "Net revenue",
+                  "format": {
+                    "type": "number-currency",
+                    "currencyCode": "GBP",
+                    "abbreviation": "compact",
+                    "decimalPlaces": {
+                      "type": "max",
+                      "places": 2
+                    }
+                  }
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Net revenue",
+                "showDescription": true,
+                "description": "Gross sales minus cancellations, Dec 2009 to Dec 2011"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 2,
+            "width": 4,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "kpi_invoices",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_sales",
+                  "fields": [
+                    {
+                      "name": "sum(invoices)",
+                      "expression": "SUM(`invoices`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(invoices)",
+                  "displayName": "Invoices"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Invoices",
+                "showDescription": true,
+                "description": "Sales invoices (no cancellations), Dec 2009 to Dec 2011"
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 2,
+            "width": 4,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "kpi_cancellation_rate",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_sales",
+                  "fields": [
+                    {
+                      "name": "measure(Cancellation Rate)",
+                      "expression": "MEASURE(`Cancellation Rate`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "measure(Cancellation Rate)",
+                  "displayName": "Cancellation rate",
+                  "format": {
+                    "type": "number-percent",
+                    "decimalPlaces": {
+                      "type": "exact",
+                      "places": 2
+                    }
+                  }
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Cancellation rate",
+                "showDescription": true,
+                "description": "Amount on cancellation invoices / gross sales, whole period"
+              }
+            }
+          },
+          "position": {
+            "x": 8,
+            "y": 2,
+            "width": 4,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "trend_net_revenue",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_sales",
+                  "fields": [
+                    {
+                      "name": "monthly(month)",
+                      "expression": "DATE_TRUNC(\"MONTH\", `month`)"
+                    },
+                    {
+                      "name": "sum(net_revenue)",
+                      "expression": "SUM(`net_revenue`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "line",
+              "encodings": {
+                "x": {
+                  "fieldName": "monthly(month)",
+                  "scale": {
+                    "type": "temporal"
+                  },
+                  "displayName": "Month"
+                },
+                "y": {
+                  "fieldName": "sum(net_revenue)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Net revenue (GBP)",
+                  "format": {
+                    "type": "number-currency",
+                    "currencyCode": "GBP",
+                    "abbreviation": "compact",
+                    "decimalPlaces": {
+                      "type": "max",
+                      "places": 2
+                    }
+                  }
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Monthly net revenue",
+                "showDescription": true,
+                "description": "Peaks every November; December 2011 is partial"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 5,
+            "width": 6,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "trend_cancellation_rate",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_sales",
+                  "fields": [
+                    {
+                      "name": "monthly(month)",
+                      "expression": "DATE_TRUNC(\"MONTH\", `month`)"
+                    },
+                    {
+                      "name": "measure(Cancellation Rate)",
+                      "expression": "MEASURE(`Cancellation Rate`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "line",
+              "encodings": {
+                "x": {
+                  "fieldName": "monthly(month)",
+                  "scale": {
+                    "type": "temporal"
+                  },
+                  "displayName": "Month"
+                },
+                "y": {
+                  "fieldName": "measure(Cancellation Rate)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Cancellation rate",
+                  "format": {
+                    "type": "number-percent",
+                    "decimalPlaces": {
+                      "type": "exact",
+                      "places": 2
+                    }
+                  }
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Monthly cancellation rate",
+                "showDescription": true,
+                "description": "Spikes are single bulk orders cancelled: 74,215 jars in Jan 2011 (GBP 77K), 80,995 paper birdies on 2011-12-09 (GBP 168K)"
+              }
+            }
+          },
+          "position": {
+            "x": 6,
+            "y": 5,
+            "width": 6,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "top_products",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_top_products",
+                  "fields": [
+                    {
+                      "name": "product_label",
+                      "expression": "`product_label`"
+                    },
+                    {
+                      "name": "net_revenue",
+                      "expression": "`net_revenue`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "net_revenue",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Net revenue (GBP)",
+                  "format": {
+                    "type": "number-currency",
+                    "currencyCode": "GBP",
+                    "abbreviation": "compact",
+                    "decimalPlaces": {
+                      "type": "max",
+                      "places": 2
+                    }
+                  }
+                },
+                "y": {
+                  "fieldName": "product_label",
+                  "scale": {
+                    "type": "categorical",
+                    "sort": {
+                      "by": "alphabetical"
+                    }
+                  },
+                  "displayName": "Product"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Top 10 products by net revenue",
+                "showDescription": true,
+                "description": "Merchandise only: postage, fees and adjustments excluded"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 11,
+            "width": 6,
+            "height": 8
+          }
+        },
+        {
+          "widget": {
+            "name": "top_countries",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_countries",
+                  "fields": [
+                    {
+                      "name": "country_label",
+                      "expression": "`country_label`"
+                    },
+                    {
+                      "name": "net_revenue",
+                      "expression": "`net_revenue`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "net_revenue",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Net revenue (GBP)",
+                  "format": {
+                    "type": "number-currency",
+                    "currencyCode": "GBP",
+                    "abbreviation": "compact",
+                    "decimalPlaces": {
+                      "type": "max",
+                      "places": 2
+                    }
+                  }
+                },
+                "y": {
+                  "fieldName": "country_label",
+                  "scale": {
+                    "type": "categorical",
+                    "sort": {
+                      "by": "alphabetical"
+                    }
+                  },
+                  "displayName": "Country"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Net revenue by country (top 15)",
+                "showDescription": true,
+                "description": "Country on the invoice; the UK is about 85% of revenue"
+              }
+            }
+          },
+          "position": {
+            "x": 6,
+            "y": 11,
+            "width": 6,
+            "height": 8
+          }
+        }
+      ]
+    }
+  ],
+  "uiSettings": {
+    "theme": {
+      "canvasBackgroundColor": {
+        "light": "#F7F8FA",
+        "dark": "#1F272D"
+      },
+      "widgetBackgroundColor": {
+        "light": "#FFFFFF",
+        "dark": "#11171C"
+      },
+      "widgetBorderColor": {
+        "light": "#FFFFFF",
+        "dark": "#11171C"
+      },
+      "fontColor": {
+        "light": "#11171C",
+        "dark": "#E8ECF0"
+      },
+      "selectionColor": {
+        "light": "#2272B4",
+        "dark": "#8ACAFF"
+      },
+      "visualizationColors": [
+        "#0072B2",
+        "#E69F00",
+        "#009E73",
+        "#CC79A7",
+        "#D55E00",
+        "#56B4E9"
+      ],
+      "widgetHeaderAlignment": "LEFT",
+      "widgetCornerRadius": 8
+    }
+  }
+}

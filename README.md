@@ -3,8 +3,10 @@
 An end-to-end batch pipeline on **Databricks Free Edition** that takes ~1.07M real e-commerce
 invoice lines through a **Medallion architecture** (bronze → silver → gold), models the gold layer
 as a **Kimball star schema**, validates it with automated **data quality checks**, and serves a small
-**AI/BI dashboard**. Infrastructure and the job are defined as code with a **Declarative Automation
-Bundle** (`databricks.yml`, formerly "Databricks Asset Bundles").
+**AI/BI dashboard**. Infrastructure, the job and the dashboard are defined as code with a
+**Declarative Automation Bundle** (`databricks.yml`, formerly "Databricks Asset Bundles").
+
+![Online Retail Sales dashboard](screenshots/dashboard.png)
 
 Stack: PySpark, Spark SQL, Delta Lake, Unity Catalog, Lakeflow Jobs (serverless), Databricks CLI,
 Declarative Automation Bundles, Databricks AI/BI dashboards.
@@ -129,7 +131,7 @@ unzip -o data/raw/online_retail_ii.zip -d data/raw
 python3 -m venv .venv && .venv/bin/pip install -r scripts/requirements.txt
 .venv/bin/python scripts/prepare_data.py data/raw/online_retail_II.xlsx data/raw
 
-# 3. Deploy: creates the 3 schemas, the landing volume and the job
+# 3. Deploy: creates the 3 schemas, the landing volume, the job and the dashboard
 databricks bundle deploy -p retail
 
 # 4. Upload the CSVs to the volume (give the full target file name)
@@ -140,13 +142,27 @@ done
 
 # 5. Run the whole pipeline (or one task: --only silver)
 databricks bundle run retail_medallion_pipeline -p retail
+
+# 6. Open the dashboard (deployed and published in step 3)
+databricks bundle open retail_sales -p retail
 ```
 
 **Manual alternative (UI only):** import the `notebooks/` folder into the workspace, run
 `00_setup`, upload the two CSVs to `workspace.retail_bronze.landing/online_retail_ii/` in Catalog
 Explorer, then run `01_bronze` → `04_quality_checks` in order (each one runs `00_setup` first).
 
-**Dashboard:** see [`dashboards/README.md`](dashboards/README.md). Screenshots are in [`screenshots/`](screenshots/).
+## Dashboard
+
+The AI/BI dashboard is code: [`dashboards/retail_sales.lvdash.json`](dashboards/retail_sales.lvdash.json)
+is declared as a `dashboards` resource in `databricks.yml`, so `databricks bundle deploy` creates (or
+updates) and publishes it. Its queries use bare table names; the bundle supplies the catalog and
+schema (`dataset_catalog`, `dataset_schema`) and looks up the SQL warehouse by name
+(`Serverless Starter Warehouse`, the one Free Edition provides), so no IDs are committed.
+
+It shows 3 counters for the whole period (net revenue in GBP, invoices, cancellation rate),
+the monthly net revenue trend, the monthly cancellation rate, the top 10 products and the top 15
+countries by net revenue. Details and the standalone SQL are in [`dashboards/README.md`](dashboards/README.md);
+the screenshot is [`screenshots/dashboard.png`](screenshots/dashboard.png).
 
 **Repo safety:** `git config core.hooksPath .githooks` enables a pre-commit hook
 (`scripts/check_repo_safety.sh`) that blocks raw data files, local config, files over 1 MB and
@@ -178,8 +194,8 @@ common credential patterns. `.gitignore` excludes `data/`, `*.csv`, `*.xlsx` and
   that cost.
 - **Why `try_cast`.** Serverless compute runs with ANSI mode on: a plain `cast` of one bad value
   fails the whole job. `try_cast` returns NULL so a validation rule can catch and quarantine it.
-- **Why a Declarative Automation Bundle.** Schemas, the volume and the job (tasks, dependencies,
-  parameters) live in Git next to the code. One `bundle deploy` recreates the setup in any
+- **Why a Declarative Automation Bundle.** Schemas, the volume, the job (tasks, dependencies,
+  parameters) and the dashboard live in Git next to the code. One `bundle deploy` recreates the setup in any
   workspace, and changes are reviewed like code.
 - **Why convert xlsx → CSV locally.** Serverless Spark has no native Excel reader, and outbound
   internet from Free Edition compute is restricted. The conversion keeps every value as text.
@@ -190,7 +206,6 @@ common credential patterns. `.gitignore` excludes `data/`, `*.csv`, `*.xlsx` and
   loads or streaming).
 - Dimensions are SCD Type 1 only; no attribute history.
 - One `dev` bundle target; no CI/CD yet.
-- The dashboard is built by hand in the UI from the SQL in `dashboards/`; it is not deployed by the bundle.
 - `cancellation_rate` is the share of gross sales on cancellation invoices (`C…`). The source does
   not say why an invoice was cancelled, so it is not presented as a return rate.
 

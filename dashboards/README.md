@@ -1,34 +1,52 @@
 # Dashboard: Online Retail Sales
 
-Four widgets plus KPI counters, built in the Databricks UI (AI/BI dashboards) on the gold layer.
-Each `.sql` file is one dataset. All queries were tested on the Free Edition serverless SQL warehouse.
+The dashboard is defined as code in [`retail_sales.lvdash.json`](retail_sales.lvdash.json) and
+deployed with the bundle (`dashboards.retail_sales` in [`../databricks.yml`](../databricks.yml)):
 
-| File | Dataset name | Widget |
-|---|---|---|
-| `01_kpis.sql` | `kpis` | Counters: net revenue, invoices, identified customers, cancellation rate |
-| `02_monthly_revenue_trend.sql` | `monthly_revenue` | Line chart: x `month`, y `net_revenue` and `gross_sales` |
-| `03_top_10_products.sql` | `top_products` | Horizontal bar: y `description`, x `net_revenue`, sorted by `revenue_rank` |
-| `04_revenue_by_country.sql` | `revenue_by_country` | Bar chart: x `country_name`, y `net_revenue` (or a table with `revenue_share`) |
-| `05_cancellation_rate.sql` | `cancellation_rate` | Line chart: x `month`, y `cancellation_rate` (format as percent) |
+```bash
+databricks bundle deploy -p <profile>       # creates/updates and publishes the dashboard
+databricks bundle open retail_sales -p <profile>
+```
 
-## Build it in the UI (about 10 minutes)
+- Warehouse: looked up by name (`Serverless Starter Warehouse`, the SQL warehouse Free Edition provides).
+- Catalog and schema: supplied by the bundle (`dataset_catalog: workspace`, `dataset_schema: retail_gold`),
+  so the queries in the JSON use bare table names.
+- To change it: edit the draft in the UI, pull it back into the JSON with
+  `databricks bundle generate dashboard --resource retail_sales --force -p <profile>` (or edit the
+  JSON directly), then redeploy. A UI edit that is not pulled back into the JSON is
+  overwritten by the next `bundle deploy`.
 
-1. Run the pipeline first, so the gold tables exist.
-2. In the workspace sidebar, open **Dashboards** and choose **Create dashboard**.
-3. Open the **Data** tab. For each `.sql` file, choose **Create from SQL**, paste the query, run it,
-   and rename the dataset to the name in the table above.
-4. Open the canvas tab and add widgets:
-   - **Counter** ×4 from `kpis`: `net_revenue`, `invoices`, `identified_customers`, `cancellation_rate`.
-   - **Line** from `monthly_revenue`: X = `month` (monthly), Y = `net_revenue` and `gross_sales`.
-   - **Bar** from `top_products`: Y = `description`, X = `net_revenue`.
-   - **Bar** from `revenue_by_country`: X = `country_name`, Y = `net_revenue`.
-     The UK is about 85% of revenue, so a second widget filtered to `country_name <> 'United Kingdom'`
-     makes the other countries readable.
-   - **Line** from `cancellation_rate`: X = `month`, Y = `cancellation_rate`.
-5. Add a text box: "Source: UCI Online Retail II (CC BY 4.0). December 2011 is a partial month (data ends 2011-12-09)."
-6. Choose **Publish**. The dashboard uses the Serverless Starter Warehouse.
-7. Take screenshots and save them in `../screenshots/` (e.g. `dashboard.png`).
+## Layout
 
-Values from the last run, to sanity-check the widgets: net revenue £19,002,774.21, gross sales
-£20,465,198.39, 40,076 invoices, 5,939 identified customers, cancellation rate 7.15%,
-top product "REGENCY CAKESTAND 3 TIER" (£314,045.02).
+| Row | Widget | Type | Dataset | Notes |
+|---|---|---|---|---|
+| 1 | Title and source note | text | | Amounts in GBP; December 2011 is a partial month |
+| 2 | Net revenue | counter | `ds_sales` | Whole period, GBP, compact |
+| 2 | Invoices | counter | `ds_sales` | Whole period; sales invoices, cancellations excluded |
+| 2 | Cancellation rate | counter | `ds_sales` | Dataset measure `-SUM(cancelled_amount) / SUM(gross_sales)` |
+| 3 | Monthly net revenue | line | `ds_sales` | |
+| 3 | Monthly cancellation rate | line | `ds_sales` | Same measure, per month; the Jan 2011 and Dec 2011 spikes are single bulk orders that were cancelled |
+| 4 | Top 10 products by net revenue | horizontal bar | `ds_top_products` | Merchandise only; labels prefixed with the rank so the bars sort by revenue |
+| 4 | Net revenue by country (top 15) | horizontal bar | `ds_countries` | Country on the invoice |
+
+`ds_sales` (month × country from `agg_monthly_revenue_by_country`) backs the counters and both
+trend charts, so they share one dataset. The counters have no sparkline on purpose: with a
+sparkline, an AI/BI counter shows the latest month instead of the total. The cancellation rate is a dataset-level measure, so it is
+computed as a ratio of sums at every level instead of averaging monthly ratios.
+
+## Standalone SQL
+
+The `.sql` files are the same metrics as fully qualified queries, for the SQL editor or another BI
+tool (each was run on the Free Edition SQL warehouse):
+
+| File | Returns |
+|---|---|
+| `01_kpis.sql` | Net revenue, gross sales, invoices, identified customers, cancellation rate |
+| `02_monthly_revenue_trend.sql` | Gross sales and net revenue per month |
+| `03_top_10_products.sql` | Top 10 merchandise products by net revenue |
+| `04_revenue_by_country.sql` | Net revenue and revenue share per country |
+| `05_cancellation_rate.sql` | Gross sales, cancelled amount and cancellation rate per month |
+
+Values from the last run, to sanity-check the widgets: net revenue £19,002,774.21, 40,076 invoices,
+cancellation rate 7.15%, top product "REGENCY CAKESTAND 3 TIER" (£314,045.02), United Kingdom
+about 85% of net revenue.
