@@ -1,19 +1,18 @@
 # Dashboard: Online Retail Sales
 
 The dashboard is defined as code in [`retail_sales.lvdash.json`](retail_sales.lvdash.json) and
-deployed with the bundle (`dashboards.retail_sales` in [`../databricks.yml`](../databricks.yml)):
-
-```bash
-databricks bundle deploy -p <profile>       # creates/updates and publishes the dashboard
-databricks bundle open retail_sales -p <profile>
-```
+deployed with the bundle (`dashboards.retail_sales` in [`../databricks.yml`](../databricks.yml)). The
+deploy workflow creates or updates and publishes it on every push to `main` (target `prod`, as the
+`github-ci` service principal). A copy owned by you can be deployed by hand with
+`databricks bundle deploy -t dev -p <profile>` and opened with
+`databricks bundle open retail_sales -t dev -p <profile>`.
 
 - Warehouse: looked up by name (`Serverless Starter Warehouse`, the SQL warehouse Free Edition provides).
 - Catalog and schema: supplied by the bundle (`dataset_catalog: workspace`, `dataset_schema: retail_gold`),
   so the queries in the JSON use bare table names.
-- To change it: edit the draft in the UI, pull it back into the JSON with
-  `databricks bundle generate dashboard --resource retail_sales --force -p <profile>` (or edit the
-  JSON directly), then redeploy. A UI edit that is not pulled back into the JSON is
+- To change it: edit the JSON (or edit a `dev` copy in the UI and pull it back with
+  `databricks bundle generate dashboard --resource retail_sales --force -t dev -p <profile>`), then
+  open a pull request; the merge deploys it. A UI edit that is not pulled back into the JSON is
   overwritten by the next `bundle deploy`.
 
 ## Layout

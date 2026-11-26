@@ -1,17 +1,23 @@
 # Retail Medallion Pipeline on Databricks
 
+[![CI](https://github.com/carlosgraterolp/retail-medallion-databricks/actions/workflows/ci.yml/badge.svg)](https://github.com/carlosgraterolp/retail-medallion-databricks/actions/workflows/ci.yml)
+[![Deploy](https://github.com/carlosgraterolp/retail-medallion-databricks/actions/workflows/deploy.yml/badge.svg?branch=main)](https://github.com/carlosgraterolp/retail-medallion-databricks/actions/workflows/deploy.yml)
+
 An end-to-end batch pipeline on **Databricks Free Edition** that takes ~1.07M real e-commerce
 invoice lines through a **Medallion architecture** (bronze → silver → gold), models the gold layer
 as a **Kimball star schema**, validates it with automated **data quality checks**, builds
 business-facing **dbt marts** (customer RFM segments, product Pareto, an incremental daily mart) on
-top of it, and serves a small **AI/BI dashboard**. Infrastructure, the job (including the dbt task)
-and the dashboard are defined as code with a **Declarative Automation Bundle** (`databricks.yml`,
-formerly "Databricks Asset Bundles").
+top of it, and serves a small **AI/BI dashboard**. Platform resources are managed with
+**Terraform**; the job (including the dbt task) and the dashboard with a **Declarative Automation
+Bundle** (`databricks.yml`, formerly "Databricks Asset Bundles"). **GitHub Actions** checks every pull
+request and, on `main`, deploys and runs the pipeline as a service principal, failing if any
+quality check or dbt test fails.
 
 ![Online Retail Sales dashboard](screenshots/dashboard.png)
 
 Stack: PySpark, Spark SQL, Delta Lake, Unity Catalog, Lakeflow Jobs (serverless), dbt Core
-(dbt-databricks), Databricks CLI, Declarative Automation Bundles, Databricks AI/BI dashboards.
+(dbt-databricks), Terraform (Databricks provider), Declarative Automation Bundles, GitHub Actions,
+Databricks CLI, Databricks AI/BI dashboards, ruff.
 
 ## Problem
 
@@ -39,6 +45,18 @@ flowchart LR
     M --> T["38 dbt tests + source freshness"]
 ```
 
+Delivery and infrastructure:
+
+```mermaid
+flowchart LR
+    DEV["Branch + pull request"] -->|"ci.yml: ruff, terraform fmt/validate,<br/>dbt parse, bundle validate"| PR{"checks green?"}
+    PR -->|"fast-forward merge"| MAIN["main"]
+    MAIN -->|"deploy.yml (OAuth M2M as github-ci)"| BUNDLE["bundle deploy -t prod<br/>(job + dashboard)"]
+    BUNDLE --> RUN["bundle run: 5 tasks<br/>fails on any failed check or test"]
+    TF["Terraform (local apply)"] -->|"schemas, volume, service principal,<br/>least-privilege grants"| UC["Unity Catalog"]
+    RUN --> UC
+```
+
 All of it runs as one Lakeflow Job with five serverless tasks:
 `bronze → silver → gold → quality_checks → dbt_marts` (four notebooks, then a dbt task that runs
 `dbt source freshness` and `dbt build` on the SQL warehouse).
@@ -56,9 +74,10 @@ All of it runs as one Lakeflow Job with five serverless tasks:
 | Marts (dbt) | `mart_customer_rfm` / `mart_product_performance` / `mart_daily_sales` | 5,939 / 4,738 / 3,237 |
 
 `bronze = silver + quarantine + duplicates` (1,027,015 + 6,209 + 34,147 = 1,067,371) is asserted on
-every run. **33 of 33** quality checks passed. The full five-task job runs in about 4 minutes on
-serverless compute (last run: bronze 28 s, silver 25 s, gold 55 s, checks 35 s, dbt 60 s); in the
-dbt task, source freshness passes and 43 of 43 dbt nodes pass (5 models and 38 tests).
+every run. **33 of 33** quality checks passed. In the last CI deployment (GitHub Actions, as the
+service principal) the whole workflow took 3 min 34 s: bronze 14 s, silver 19 s, gold 46 s, checks
+30 s, dbt 61 s; in the dbt task, source freshness passes and 43 of 43 dbt nodes pass (5 models and
+38 tests).
 
 ## Tables
 
@@ -125,8 +144,8 @@ marked FAILED. The next full run rebuilt the fact and all checks passed.
 
 ## How to deploy and run
 
-Requirements: a Databricks Free Edition workspace, Databricks CLI v1.28.0 (the version this was built and tested with), Python 3
-(only to convert the source file).
+Requirements: a Databricks Free Edition workspace, Databricks CLI v1.28.0 and Terraform 1.17.2 (the
+versions this was built and tested with), Python 3 (only to convert the source file).
 
 ```bash
 # 1. Authenticate (OAuth in the browser; credentials stay in ~/.databrickscfg)
@@ -139,8 +158,11 @@ unzip -o data/raw/online_retail_ii.zip -d data/raw
 python3 -m venv .venv && .venv/bin/pip install -r scripts/requirements.txt
 .venv/bin/python scripts/prepare_data.py data/raw/online_retail_II.xlsx data/raw
 
-# 3. Deploy: creates the 4 schemas, the landing volume, the job and the dashboard
-databricks bundle deploy -p retail
+# 3. Platform (Terraform): schemas, landing volume, CI service principal and its grants
+brew trust hashicorp/tap && brew install hashicorp/tap/terraform
+cd terraform && cp terraform.tfvars.example terraform.tfvars   # set your CLI profile name
+terraform init && terraform plan && terraform apply && cd ..
+#    The import blocks adopt existing schemas/volume; on a fresh workspace, remove them first.
 
 # 4. Upload the CSVs to the volume (give the full target file name)
 databricks fs mkdir dbfs:/Volumes/workspace/retail_bronze/landing/online_retail_ii -p retail
@@ -148,22 +170,22 @@ for f in data/raw/online_retail_ii_*.csv; do
   databricks fs cp "$f" "dbfs:/Volumes/workspace/retail_bronze/landing/online_retail_ii/$(basename "$f")" -p retail
 done
 
-# 5. Run the whole pipeline, dbt task included (or one task: --only silver)
-databricks bundle run retail_medallion_pipeline -p retail
-
-# 6. Open the dashboard (deployed and published in step 3)
-databricks bundle open retail_sales -p retail
+# 5. Deploy and run: normally done by GitHub Actions on every push to main (see CI/CD).
+#    By hand, the dev target deploys a copy owned by you (it writes to the same tables):
+databricks bundle deploy -t dev -p retail
+databricks bundle run -t dev retail_medallion_pipeline -p retail   # or one task: --only silver
 ```
 
-**Manual alternative (UI only):** import the `notebooks/` folder into the workspace, run
-`00_setup`, upload the two CSVs to `workspace.retail_bronze.landing/online_retail_ii/` in Catalog
-Explorer, then run `01_bronze` → `04_quality_checks` in order (each one runs `00_setup` first).
+**Manual alternative (UI only):** after the Terraform step, import the `notebooks/` folder into the
+workspace, upload the two CSVs to `workspace.retail_bronze.landing/online_retail_ii/` in Catalog
+Explorer, then run `01_bronze` → `04_quality_checks` in order (each one runs `00_setup` first, which
+checks that the schemas and volume exist).
 
 ## Dashboard
 
 The AI/BI dashboard is code: [`dashboards/retail_sales.lvdash.json`](dashboards/retail_sales.lvdash.json)
-is declared as a `dashboards` resource in `databricks.yml`, so `databricks bundle deploy` creates (or
-updates) and publishes it. Its queries use bare table names; the bundle supplies the catalog and
+is declared as a `dashboards` resource in `databricks.yml`, so `databricks bundle deploy` (run by the
+deploy workflow for the `prod` target) creates or updates it and publishes it. Its queries use bare table names; the bundle supplies the catalog and
 schema (`dataset_catalog`, `dataset_schema`) and looks up the SQL warehouse by name
 (`Serverless Starter Warehouse`, the one Free Edition provides), so no IDs are committed.
 
@@ -183,15 +205,17 @@ heavy, file-oriented engineering (ingesting raw files, typing, deduplicating, qu
 the conformed star schema), and dbt does the business-facing modelling in SQL, where analysts can
 read and review it, with tests and documentation next to each model and lineage generated
 automatically. dbt only reads the gold layer (declared as `sources`) and writes to its own schema,
-`retail_marts`.
+`retail_marts` (in the pipeline) or `retail_marts_dev` (local runs).
 
 **How it runs.**
 - **In the job:** task `dbt_marts` is a `dbt_task` in `databricks.yml`. It runs dbt Core on
   serverless compute (`dbt-databricks==1.13.1` as an environment dependency) against the SQL
-  warehouse. Databricks generates the dbt profile and injects the run-as user's token, so nothing is
-  configured or stored for it. Verified on Free Edition.
+  warehouse. Databricks generates the dbt profile and injects a token for the job's run-as identity
+  (the `github-ci` service principal in `prod`), so nothing is configured or stored for it. Verified
+  on Free Edition.
 - **Locally:** `dbt/profiles.example.yml` shows the profile, which lives in `~/.dbt/profiles.yml`
   (outside the repo) and uses OAuth in the browser (`auth_type: oauth`), so no token is stored.
+  Local runs write to **`retail_marts_dev`**, never to `retail_marts` (see "Who owns what").
 
 ```bash
 python3.13 -m venv .venv-dbt && .venv-dbt/bin/pip install -r dbt/requirements.txt
@@ -278,6 +302,100 @@ run 3, including the reconciliation with `fact_sales`.
 
 ![dbt lineage graph](screenshots/dbt_lineage.png)
 
+## Infrastructure as code
+
+### Terraform vs bundle: who manages what
+
+| Managed by | Resources | Why there |
+|---|---|---|
+| **Terraform** (`terraform/`) | The 5 schemas (`retail_bronze`, `retail_silver`, `retail_gold`, `retail_marts`, `retail_marts_dev`), the landing volume, the `github-ci` service principal, its grants | Platform: long-lived, shared, changes rarely, needs a reviewed `plan` before `apply` |
+| **Bundle** (`databricks.yml`) | The 5-task job and the dashboard | Application: deployed together with the code it runs, on every merge |
+| **Neither** | The service principal's OAuth secret | In Terraform it would be stored in plain text in the state file; it is created with the CLI and piped straight into GitHub secrets |
+
+Nothing is managed twice. The schemas and volume were first created by the bundle; moving them
+was done without recreating anything: `prevent_destroy` in the bundle, `bundle deployment unbind`,
+removal from `databricks.yml` (bundle plan: 0 to delete), then Terraform `import` blocks (plan:
+`5 to import, 5 to add, 0 to change, 0 to destroy`). `prevent_destroy` also protects them in
+Terraform.
+
+- **Provider:** `databricks/databricks` `~> 1.145` (v1.145.0), Terraform `>= 1.10` (built with 1.17.2).
+  Authentication comes from a Databricks CLI profile (OAuth U2M), so the code has no host, token or ID.
+- **State:** local and gitignored. There is one operator, and CI runs only `terraform fmt -check` and
+  `validate` (with `-backend=false`, no credentials). Trade-off: the state lives on one laptop; if
+  lost, the `import` blocks rebuild it with one `apply`. A remote backend (for example the HCP
+  Terraform free tier) would allow `plan` in CI at the cost of another account and API token.
+- **Least privilege:** the service principal gets `USE_SCHEMA`, `SELECT`, `MODIFY`, `CREATE_TABLE` on
+  the 4 pipeline schemas and `READ_VOLUME` on the landing volume, through `databricks_grant`, which
+  manages only that principal's grants and never touches anyone else's. `USE CATALOG` and `CAN USE`
+  on the SQL warehouse come from the workspace `users` group (verified as effective privileges), so
+  no catalog grant and no authoritative warehouse permission resource are needed. No `MANAGE`, no
+  `CREATE SCHEMA`; `00_setup` only checks that the platform objects exist.
+
+### Who owns what (and why)
+
+| Objects | Owner |
+|---|---|
+| Schemas, volume, the bronze, silver and gold tables, the 3 dbt mart tables | the developer's user (created before CI existed); the service principal writes to them with `MODIFY` |
+| The 2 dbt views in `retail_marts` (`stg_sales`, `stg_customers`) | the `github-ci` service principal |
+| Everything in `retail_marts_dev` | whoever runs dbt locally |
+
+The rule is that **the pipeline identity owns the outputs it has to replace**. Overwriting a table
+(Spark `saveAsTable` in overwrite mode, dbt's `CREATE OR REPLACE TABLE`, `MERGE`) worked with `MODIFY`
+and `CREATE_TABLE`, but **replacing a view requires its owner or `MANAGE`**: the first CI deployment
+failed in `dbt_marts` with `PERMISSION_DENIED: Principal 'github-ci' does not have MANAGE on Table
+'workspace.retail_marts.stg_customers'`.
+
+- **Why ownership could not be transferred:** `ALTER VIEW ... OWNER TO` the service principal was
+  refused with `Non-admin user can only transfer ownerships for views to groups the owner is a member
+  of`. In Unity Catalog, a *workspace* admin administers the workspace (users, jobs, settings), while
+  securables in the metastore follow their own model: only a *metastore* admin (or an owner, toward
+  groups they belong to) can hand an object to another principal. On Free Edition the user is a
+  workspace admin, not a metastore admin.
+- **Why recreating was the least-privilege fix:** the alternative was `MANAGE` on `retail_marts`,
+  which would also let the service principal grant access to and drop any object in that schema,
+  now and in the future. Instead the two views (no data, rebuilt in seconds) were dropped and the
+  next CI run recreated them, so the service principal owns exactly what it produces and nothing
+  more. Local dbt runs moved to `retail_marts_dev` so a developer never competes with CI over
+  ownership in `retail_marts`.
+
+## CI/CD
+
+| Workflow | Trigger | What it does |
+|---|---|---|
+| [`ci.yml`](.github/workflows/ci.yml) | pull request to `main` | `ruff check`; `terraform fmt -check` and `validate`; `dbt parse`; `databricks bundle validate --strict -t prod`. Never deploys. |
+| [`deploy.yml`](.github/workflows/deploy.yml) | push to `main`, manual run | `bundle validate`, `bundle deploy -t prod` (job and dashboard), `bundle run` of the job. **Fails if any task fails**, including the 33 quality checks and `dbt build`; writes a run summary (task, state, duration, row counts, `checks=33 passed=33`, dbt `PASS=43`). One deployment at a time. |
+
+- **Authentication:** OAuth M2M as the `github-ci` service principal. Its client ID and secret, the
+  workspace host and the workspace ID are GitHub Actions secrets; nothing secret is in the repo.
+  The host and IDs appear as `***` in the public logs; the workspace ID, which Databricks prints in
+  run URLs, is masked explicitly as the first step of each job. Actions are pinned to commit SHAs.
+- **Why not GitHub OIDC (no stored secret at all):** it needs a service principal federation policy,
+  which is created through the account console or account API; Free Edition has no account-level
+  access. A personal access token was the other option and was not used: it would carry all of a
+  user's permissions.
+- **Prod target:** `mode: production`, `root_path` in the service principal's home (only it and admins
+  can write there; no email in paths), `run_as` the service principal. Only CI deploys it.
+- **Merges** are fast-forwarded locally (`git merge --ff-only` and `git push`) so every commit on
+  `main` is authored and committed by the developer; GitHub marks the pull request as merged.
+- **Pull requests from forks** get no secrets, so the bundle validation job is skipped for them.
+
+### Service principal secret: expiry and rotation
+
+The current OAuth secret of `github-ci` **expires on 2027-05-25 (21:31 UTC)** (180-day lifetime).
+Databricks also deletes a secret that is not used for 90 days. To rotate it before then:
+
+1. Create a new secret and pipe it into GitHub without displaying it:
+   ```bash
+   SP_ID=$(terraform -chdir=terraform output -raw ci_service_principal_id)
+   databricks service-principal-secrets-proxy create "$SP_ID" --lifetime 15552000s -p retail -o json \
+     | python3 -c "import json,sys; print(json.load(sys.stdin)['secret'], end='')" \
+     | gh secret set DATABRICKS_CLIENT_SECRET
+   ```
+2. Run the deploy workflow by hand (`gh workflow run deploy.yml`) and check it is green.
+3. Delete the old secret: `databricks service-principal-secrets-proxy list "$SP_ID" -p retail`, then
+   `databricks service-principal-secrets-proxy delete "$SP_ID" <old secret id> -p retail`.
+4. Update the expiry date in this section.
+
 ## Design decisions
 
 - **Why Medallion.** Each layer has one job: bronze is a replayable copy of the source, silver is
@@ -304,9 +422,14 @@ run 3, including the reconciliation with `fact_sales`.
   that cost.
 - **Why `try_cast`.** Serverless compute runs with ANSI mode on: a plain `cast` of one bad value
   fails the whole job. `try_cast` returns NULL so a validation rule can catch and quarantine it.
-- **Why a Declarative Automation Bundle.** Schemas, the volume, the job (tasks, dependencies,
-  parameters) and the dashboard live in Git next to the code. One `bundle deploy` recreates the setup in any
-  workspace, and changes are reviewed like code.
+- **Why a Declarative Automation Bundle.** The job (tasks, dependencies, parameters) and the
+  dashboard live in Git next to the code they run, and one `bundle deploy` ships both together.
+- **Why Terraform as well.** The platform (schemas, volume, identities, grants) has a different
+  lifecycle: it changes rarely, is shared by several pipelines, and destructive changes must be seen
+  in a `plan` first. Splitting it from the bundle means a code deploy can never drop a schema.
+- **Why the pipeline fails on data quality.** A wrong number on a dashboard is worse than a late one.
+  The job fails on any failed check, so the deploy workflow goes red and the bad data is visible
+  immediately instead of being consumed.
 - **Why convert xlsx → CSV locally.** Serverless Spark has no native Excel reader, and outbound
   internet from Free Edition compute is restricted. The conversion keeps every value as text.
 
@@ -316,7 +439,12 @@ run 3, including the reconciliation with `fact_sales`.
   streaming. Only the dbt daily mart is incremental, and its "new data" is simulated with a cutoff
   variable because the source is static.
 - Dimensions are still SCD Type 1 only; no attribute history (RFM uses each customer's latest country).
-- One `dev` bundle target; no CI/CD yet.
+- One workspace and one catalog (Free Edition): the `prod` target and a hand-deployed `dev` target
+  write to the same tables. Only CI deploys `prod`; the `dev` deployment is not normally deployed.
+- Terraform runs locally with local state (one operator); CI validates the configuration but does
+  not plan or apply it.
+- CI authenticates with a stored OAuth secret (rotated by hand, expiry above), because GitHub OIDC
+  federation needs account-level access that Free Edition does not provide.
 - `cancellation_rate` is the share of gross sales on cancellation invoices (`C…`). The source does
   not say why an invoice was cancelled, so it is not presented as a return rate.
 

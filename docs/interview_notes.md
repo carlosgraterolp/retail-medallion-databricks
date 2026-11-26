@@ -2,7 +2,7 @@
 
 Preguntas probables sobre este proyecto, con respuestas cortas basadas en lo que construí.
 Cifras de la última corrida: bronze 1.067.371 filas → silver 1.027.015 + cuarentena 6.209 +
-duplicados 34.147; `fact_sales` 1.027.015; 33/33 checks OK; job completo (5 tareas, con dbt) ~4 min en serverless.
+duplicados 34.147; `fact_sales` 1.027.015; 33/33 checks OK; job completo (5 tareas, con dbt) ~3,5 min en el último deploy por CI.
 Capa dbt: 5 modelos y 38 tests (43/43 OK); RFM 5.939 clientes; 4.738 productos; 3.237 filas día × país.
 
 ---
@@ -93,14 +93,18 @@ es medible (6.209 filas, sobre todo precio cero y cantidades negativas sin cance
 estaba mal, se reprocesa. Las cancelaciones (factura con "C") y las ventas sin cliente **no** se
 rechazan: son hechos de negocio y se marcan con flags.
 
-## 13. Infraestructura como código: Bundles vs Terraform
-- **Declarative Automation Bundles** (antes Databricks Asset Bundles): YAML (`databricks.yml`) que
-  versiona en Git los recursos *del proyecto*: aquí 4 esquemas, el volumen, el job con sus 5 tareas (4 notebooks + dbt) y el dashboard.
-  `bundle deploy` crea/actualiza, `bundle run` ejecuta. Pensado para el ciclo de desarrollo de
-  datos (targets dev/prod, despliegue del código junto a la definición).
-- **Terraform** (provider de Databricks): para la *plataforma*: workspaces, metastore, permisos,
-  redes, cloud. Gestiona estado y sirve para varias nubes y servicios.
-- Regla práctica: Terraform para la infraestructura base, Bundles para los pipelines que corren encima.
+## 13. Infraestructura como código: Bundles vs Terraform (cómo lo dividí)
+- **Terraform** gestiona la *plataforma*: los 5 esquemas, el volumen `landing`, el service principal
+  `github-ci` y sus grants. Cambia poco, es compartida, y un cambio destructivo tiene que verse en un
+  `plan` antes del `apply`.
+- **Bundle** (`databricks.yml`, Declarative Automation Bundles, antes Asset Bundles) gestiona la
+  *aplicación*: el job de 5 tareas (4 notebooks + dbt) y el dashboard, desplegados junto al código.
+- **Nada se gestiona dos veces.** Al principio el bundle creaba los esquemas; los moví sin recrear
+  nada: `prevent_destroy` en el bundle → `bundle deployment unbind` → quitarlos del YAML (plan del
+  bundle: 0 a borrar) → `import` en Terraform (plan: 5 import, 5 add, 0 destroy).
+- Beneficio: un deploy de código nunca puede borrar un esquema con datos.
+- El **secreto** del service principal no está en ninguno de los dos: en Terraform quedaría en texto
+  plano en el state.
 
 ## 14. Serverless en Free Edition: ¿qué cambió respecto a clusters?
 Free Edition es solo serverless: no hay clusters clásicos ni configuración de nodos. Usa Spark
@@ -179,10 +183,72 @@ warehouse; Databricks genera el profile e inyecta el token del usuario, no guard
   (£11,41M de £16,29M). "At risk": 712 clientes, 5,4 compras de media pero ~358 días sin comprar,
   £1,33M: el objetivo obvio de retención. Pareto: **21,9%** de los productos (1.038 de 4.738) hacen el 80%.
 
-## 22. ¿Qué mejorarías? (siguientes pasos)
-1. ~~Modelos dbt sobre gold~~ (hecho).
-2. **Terraform** para los recursos del workspace.
-3. **CI con GitHub Actions**: validar el bundle, `dbt build` y los checks de calidad en cada PR.
+## 22. Terraform: providers, state, plan vs apply, import
+- **Provider**: plugin que traduce recursos HCL a llamadas API. Usé `databricks/databricks ~> 1.145`
+  (fijado en `versions.tf`, con `.terraform.lock.hcl` versionado). Se autentica con el perfil de la
+  CLI (OAuth), así el código no tiene host, token ni IDs.
+- **State**: el mapa entre el código y los objetos reales (IDs, atributos). Sin state Terraform no
+  sabe qué es suyo. Lo tengo **local y en .gitignore** (un solo operador; puede contener datos
+  sensibles). Contrapartida: vive en un portátil; si se pierde, los bloques `import` lo reconstruyen.
+  Un backend remoto (HCP Terraform free, S3+lock) permitiría `plan` en CI y trabajo en equipo.
+- **plan vs apply**: `plan` calcula la diferencia entre código y realidad sin tocar nada; `apply`
+  ejecuta ese plan. Guardo el plan (`-out`) y aplico exactamente ese archivo, y reviso siempre la
+  línea `X to add, Y to change, Z to destroy` antes. `terraform plan -detailed-exitcode` devuelve 0
+  si no hay cambios: lo usé para comprobar que no hay drift después de cada apply.
+- **import**: adoptar un objeto que ya existe sin recrearlo. Usé bloques `import { to = ..., id = "workspace.retail_gold" }`
+  (Terraform ≥ 1.5): el plan dijo "5 to import" y el apply no tocó ninguna tabla.
+- **`prevent_destroy`**: Terraform se niega a ejecutar un plan que destruya esos esquemas o el volumen.
+- **`databricks_grant` vs `databricks_grants`**: `grants` es autoritativo para todo el objeto (borraría
+  los permisos de otros); `grant` solo gestiona los de un principal. Usé `grant`.
+
+## 23. CI vs CD en este proyecto
+- **CI** (`ci.yml`, en cada pull request): verifica sin desplegar: `ruff`, `terraform fmt -check` y
+  `validate` (sin backend ni credenciales), `dbt parse`, `bundle validate --strict -t prod`.
+- **CD** (`deploy.yml`, en push a `main` o manual): `bundle deploy -t prod` y `bundle run` del job.
+  Es *continuous deployment*: lo que entra a main se despliega y se ejecuta. Un solo deploy a la vez
+  (`concurrency`), nunca se cancela a mitad.
+- Terraform **no** se aplica en CI (state local): la plataforma cambia poco y la aplico yo tras revisar el plan.
+- Merge con fast-forward local para que los commits de main sean míos; GitHub marca el PR como merged.
+
+## 24. ¿Cómo manejas los secretos?
+- CI se autentica con **OAuth M2M** como el service principal `github-ci` (tokens de 1 hora).
+  Client ID, secreto, host e ID del workspace son **GitHub Actions secrets**; nada en el repo.
+- El secreto se creó con la CLI y se pasó **por pipe** a `gh secret set`: nunca se mostró, ni en
+  pantalla, ni en un archivo, ni en argumentos de comandos.
+- En los logs (públicos) aparecen como `***`. El ID del workspace no es credencial y Databricks lo
+  imprime en las URLs (`?o=...`): se me filtró una vez en un log, borré esos logs (la API devolvió 404
+  después) y ahora lo enmascaro con `::add-mask::` como primer paso de cada job.
+- **GitHub OIDC** (sin secreto guardado) habría sido mejor, pero exige una federation policy a nivel
+  de cuenta, y Free Edition no tiene acceso a la cuenta. Un PAT habría tenido todos mis permisos.
+- **Rotación**: el secreto vence el 2027-05-25 (180 días); pasos en el README (crear nuevo por pipe,
+  correr el deploy, borrar el viejo). Databricks borra secretos sin uso en 90 días.
+- **Mínimo privilegio**: el SP solo tiene `USE_SCHEMA`, `SELECT`, `MODIFY`, `CREATE_TABLE` en los 4
+  esquemas del pipeline y `READ_VOLUME` en el volumen. Ni `MANAGE` ni `CREATE SCHEMA`.
+
+## 25. ¿Por qué el pipeline falla por calidad de datos?
+Un número incorrecto en un dashboard es peor que uno tardío. Si falla cualquiera de los 33 checks o
+un test de dbt, el job falla, `bundle run` devuelve error y el workflow de deploy se pone en rojo:
+el problema se ve de inmediato y los datos malos no se consumen en silencio. Lo probé: con una fila
+huérfana, 3 de 33 checks fallaron y el job quedó FAILED.
+
+## 26. Ownership en Unity Catalog: ¿por qué no transferiste las vistas y qué hiciste?
+- El primer deploy por CI falló en dbt: `PERMISSION_DENIED: ... does not have MANAGE on ... stg_customers`.
+  **Reemplazar una vista exige ser su owner o tener `MANAGE`**; sobrescribir tablas (overwrite,
+  `CREATE OR REPLACE TABLE`, `MERGE`) funcionó con `MODIFY` + `CREATE_TABLE`.
+- `ALTER VIEW ... OWNER TO` el SP fue rechazado: "Non-admin user can only transfer ownerships for views
+  to groups the owner is a member of". **Admin del workspace ≠ admin del metastore**: el primero
+  administra el workspace (usuarios, jobs, ajustes); los objetos de Unity Catalog siguen su propio
+  modelo, y solo un admin del metastore (o el owner, hacia grupos a los que pertenece) puede
+  regalarlos a otro principal. En Free Edition soy admin del workspace, no del metastore.
+- **Solución de mínimo privilegio**: borrar las 2 vistas (sin datos, se reconstruyen en segundos) y
+  dejar que CI las recree: el SP pasa a ser owner de lo que produce, y nada más. La alternativa,
+  `MANAGE` sobre `retail_marts`, le habría dado poder para dar acceso y borrar cualquier objeto del
+  esquema. dbt local escribe ahora en `retail_marts_dev` para no pelear por ownership con CI.
+
+## 27. ¿Qué mejorarías? (siguientes pasos)
+1. ~~Modelos dbt sobre gold~~, ~~Terraform~~, ~~CI/CD con GitHub Actions~~ (hecho).
+2. Backend remoto para el state de Terraform y `terraform plan` en cada PR.
+3. Un catálogo o workspace separado para dev, para que dev y prod no escriban las mismas tablas.
 4. SCD2 en `dim_customer` (snapshots de dbt) e ingesta incremental real en bronze (Auto Loader).
 
 ## Preguntas trampa
