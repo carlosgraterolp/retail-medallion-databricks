@@ -26,6 +26,12 @@ jobs:
       DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
       BUNDLE_VAR_ci_service_principal: ${{ secrets.DATABRICKS_CLIENT_ID }}
     steps:
+      # First step: mask the workspace ID explicitly, before any Databricks command runs. Databricks
+      # prints it in run URLs (?o=<id>); it is not a credential, so it is masked on purpose here.
+      - name: Mask workspace ID
+        env:
+          WORKSPACE_ID: ${{ secrets.DATABRICKS_WORKSPACE_ID }}
+        run: echo "::add-mask::$WORKSPACE_ID"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: databricks/setup-cli@e1dad86b08f6ea07707aea128ec4bfa76af8db55 # v1.28.0
 

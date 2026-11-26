@@ -11,5 +11,7 @@ retail_medallion:
       host: "{{ env_var('DATABRICKS_HOST') }}"
       http_path: "{{ env_var('DATABRICKS_HTTP_PATH') }}"
       catalog: workspace
-      schema: retail_marts
+      # Local runs write to retail_marts_dev (created by Terraform). retail_marts is owned by the
+      # CI service principal and is written only by the pipeline's dbt task.
+      schema: retail_marts_dev
       threads: 4

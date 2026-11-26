@@ -23,6 +23,15 @@ resource "databricks_schema" "this" {
   }
 }
 
+# Developer schema for local dbt runs (profiles.example.yml). The CI service principal gets no
+# grants here, and the objects in it are owned by whoever builds them locally. No
+# prevent_destroy: everything in it can be rebuilt with `dbt build`.
+resource "databricks_schema" "marts_dev" {
+  catalog_name = var.catalog
+  name         = var.marts_dev_schema_name
+  comment      = "Local dbt development output (not used by the pipeline or the dashboard)"
+}
+
 resource "databricks_volume" "landing" {
   catalog_name = var.catalog
   schema_name  = databricks_schema.this["bronze"].name

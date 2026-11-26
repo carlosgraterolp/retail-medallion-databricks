@@ -31,3 +31,9 @@ variable "ci_service_principal_name" {
   type        = string
   default     = "github-ci"
 }
+
+variable "marts_dev_schema_name" {
+  description = "Schema where local dbt runs write, so they never touch the marts owned by CI."
+  type        = string
+  default     = "retail_marts_dev"
+}

@@ -10,7 +10,7 @@ output "ci_service_principal_application_id" {
 
 output "schemas" {
   description = "Fully qualified schema names."
-  value       = { for k, s in databricks_schema.this : k => s.id }
+  value       = merge({ for k, s in databricks_schema.this : k => s.id }, { marts_dev = databricks_schema.marts_dev.id })
 }
 
 output "landing_volume_path" {
