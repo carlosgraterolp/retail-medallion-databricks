@@ -171,7 +171,7 @@ for f in data/raw/online_retail_ii_*.csv; do
 done
 
 # 5. Deploy and run: normally done by GitHub Actions on every push to main (see CI/CD).
-#    By hand, the dev target deploys a copy owned by you (it writes to the same tables):
+#    By hand, the dev target deploys your own copy, which writes only to the *_dev schemas:
 databricks bundle deploy -t dev -p retail
 databricks bundle run -t dev retail_medallion_pipeline -p retail   # or one task: --only silver
 ```
@@ -358,6 +358,24 @@ failed in `dbt_marts` with `PERMISSION_DENIED: Principal 'github-ci' does not ha
   more. Local dbt runs moved to `retail_marts_dev` so a developer never competes with CI over
   ownership in `retail_marts`.
 
+### Read access to prod (and why it is a direct grant)
+
+Once the pipeline recreates objects as `github-ci`, **owning the schema does not give the developer
+access to them**: Unity Catalog checks the object's owner and grants, so `SELECT` on a view owned by
+the service principal failed with `INSUFFICIENT_PERMISSIONS`. `SELECT` and `USE_SCHEMA` granted *on
+the schema* apply to every current and future object in it, whoever owns it, so the fix is a
+read-only schema grant. Three principals were tried, in this order:
+
+| Attempt | Result |
+|---|---|
+| Workspace group `admins` | refused: `Could not find principal with name admins` (a workspace-local group, unknown to Unity Catalog) |
+| System group `_workspace_admins_workspace_<id>` (read at plan time from the owner of the `default` schema) | refused: `Cannot grant privileges on schema to system generated group` |
+| Group `retail-readers` created by Terraform, with the Terraform runner as member | refused: `Could not find principal with name retail-readers`. Groups created through the workspace API stay workspace-local; Unity Catalog needs account-level groups, which are created in the account console, and Free Edition has none. Terraform destroyed the group again. |
+| **Direct grant to the person running Terraform** (`data.databricks_current_user`, read at plan time) | **applied**: `USE_SCHEMA` + `SELECT` on the 4 prod schemas. Read-only; no user name in the code. |
+
+On a workspace with an account console, the third option (an account-level reader group) would be
+the better design: access would belong to a role, not to one person.
+
 ## CI/CD
 
 | Workflow | Trigger | What it does |
@@ -439,12 +457,14 @@ Databricks also deletes a secret that is not used for 90 days. To rotate it befo
   streaming. Only the dbt daily mart is incremental, and its "new data" is simulated with a cutoff
   variable because the source is static.
 - Dimensions are still SCD Type 1 only; no attribute history (RFM uses each customer's latest country).
-- One workspace and one catalog (Free Edition): the `prod` target and a hand-deployed `dev` target
-  write to the same tables. Only CI deploys `prod`; the `dev` deployment is not normally deployed.
+- One workspace and one catalog (Free Edition): `dev` is isolated by schema (`retail_*_dev`), not by
+  catalog or workspace. Both environments read the same landing volume (read-only).
 - Terraform runs locally with local state (one operator); CI validates the configuration but does
   not plan or apply it.
 - CI authenticates with a stored OAuth secret (rotated by hand, expiry above), because GitHub OIDC
   federation needs account-level access that Free Edition does not provide.
+- Read access to prod is a direct grant to the developer, not a group, because Free Edition has no
+  account-level groups (see "Read access to prod").
 - `cancellation_rate` is the share of gross sales on cancellation invoices (`C…`). The source does
   not say why an invoice was cancelled, so it is not presented as a return rate.
 

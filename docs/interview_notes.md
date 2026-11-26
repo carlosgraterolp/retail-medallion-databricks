@@ -244,6 +244,15 @@ huérfana, 3 de 33 checks fallaron y el job quedó FAILED.
   dejar que CI las recree: el SP pasa a ser owner de lo que produce, y nada más. La alternativa,
   `MANAGE` sobre `retail_marts`, le habría dado poder para dar acceso y borrar cualquier objeto del
   esquema. dbt local escribe ahora en `retail_marts_dev` para no pelear por ownership con CI.
+- **Acceso de lectura a prod**: ser owner del *esquema* no da acceso a objetos de otro owner (un
+  `SELECT` sobre una vista del SP falló con `INSUFFICIENT_PERMISSIONS`). Un grant `SELECT` +
+  `USE_SCHEMA` **sobre el esquema** vale para todos los objetos actuales y futuros, sea quien sea el
+  owner. Probé tres principals: el grupo `admins` del workspace (Unity Catalog no lo conoce), el
+  grupo de sistema `_workspace_admins_...` (no admite grants) y un grupo `retail-readers` creado con
+  Terraform (queda local al workspace; Unity Catalog necesita grupos de *cuenta*, que se crean en el
+  account console, y Free Edition no lo tiene). Quedó un **grant directo de solo lectura al usuario
+  que ejecuta Terraform**, leído en el plan (`data.databricks_current_user`), sin nombres en el código.
+  Con account console, lo correcto sería un grupo de lectores a nivel de cuenta.
 
 ## 27. ¿Qué mejorarías? (siguientes pasos)
 1. ~~Modelos dbt sobre gold~~, ~~Terraform~~, ~~CI/CD con GitHub Actions~~ (hecho).

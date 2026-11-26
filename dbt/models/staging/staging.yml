@@ -21,3 +21,19 @@ models:
         data_tests: [unique, not_null]
       - name: customer_id
         data_tests: [unique, not_null]
+  - name: stg_product_catalog
+    description: >
+      Product catalog from the semi-structured JSON feed. Columns prefixed synthetic_ are
+      SYNTHETIC (keyword rules on the description) and must not be read as real merchandising data.
+    columns:
+      - name: stock_code
+        data_tests: [unique, not_null]
+      - name: synthetic_category
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['Christmas & Seasonal', 'Lighting & Candles', 'Bags & Storage', 'Kitchen & Dining',
+                         'Stationery & Party', 'Toys & Kids', 'Garden', 'Home Decor', 'Other']
+      - name: synthetic_tags
+        description: Only present for products from catalog batch 3 (the schema-evolution batch); NULL before.

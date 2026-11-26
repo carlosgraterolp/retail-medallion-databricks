@@ -13,6 +13,10 @@
 
 # COMMAND ----------
 
+# MAGIC %run ./silver_rules
+
+# COMMAND ----------
+
 import datetime
 from decimal import Decimal
 
@@ -84,7 +88,35 @@ CHECKS = [
      f"SELECT sum(net_revenue) FROM {T_AGG_MONTHLY_COUNTRY}", silver_revenue),
     ("revenue_fact_equals_agg_cancellation_rate", "gold",
      f"SELECT sum(gross_sales) - sum(cancelled_amount) FROM {T_AGG_CANCELLATION_RATE}", silver_revenue),
+    # --- semi-structured product catalog (JSON)
+    ("catalog_stock_code_unique", "silver",
+     f"SELECT count(*) - count(DISTINCT stock_code) FROM {T_SILVER_CATALOG}", 0),
+    ("ri_price_history_to_catalog", "silver",
+     f"SELECT count(*) FROM {T_SILVER_PRICES} p LEFT ANTI JOIN {T_SILVER_CATALOG} c USING (stock_code)", 0),
 ]
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Incremental silver = full recomputation
+# MAGIC Rebuild silver from the whole bronze table in one batch, with the same `silver_rules`, and compare
+# MAGIC it with the silver table that the streams built batch by batch: same `line_id`s (none missing, none
+# MAGIC extra), same quarantine row count, same revenue. This is the proof that incremental processing
+# MAGIC (checkpoints, insert-only MERGE, cross-batch dedup) gives exactly the full-refresh result.
+
+# COMMAND ----------
+
+from pyspark.sql import functions as F
+
+full = validate(spark.table(T_BRONZE))
+full_silver = dedup(to_silver(full.filter(F.size("failed_rules") == 0)))
+incremental = spark.table(T_SILVER)
+missing = full_silver.select("line_id").exceptAll(incremental.select("line_id")).count()
+extra = incremental.select("line_id").exceptAll(full_silver.select("line_id")).count()
+full_revenue = full_silver.agg(F.sum("line_amount")).first()[0]
+full_quarantine = full.filter(F.size("failed_rules") > 0).count()
+recompute_observed = f"missing={missing} extra={extra} quarantine={n_quarantine} revenue={silver_revenue}"
+recompute_expected = f"missing=0 extra=0 quarantine={full_quarantine} revenue={full_revenue}"
 
 # COMMAND ----------
 
@@ -95,6 +127,9 @@ for name, layer, sql, expected in CHECKS:
     passed = observed == expected
     results.append(Row(run_ts=run_ts, check_name=name, layer=layer,
                        observed=str(observed), expected=str(expected), passed=passed))
+results.append(Row(run_ts=run_ts, check_name="silver_incremental_equals_full_recompute", layer="silver",
+                   observed=recompute_observed, expected=recompute_expected,
+                   passed=recompute_observed == recompute_expected))
 
 results_df = spark.createDataFrame(results)
 results_df.write.format("delta").mode("append").saveAsTable(T_DQ_RESULTS)

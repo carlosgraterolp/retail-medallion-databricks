@@ -1,21 +1,19 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # 02_silver: clean, conform, validate, deduplicate
+# MAGIC # 02_silver: incremental cleaning, validation, dedup and quarantine
 # MAGIC
-# MAGIC Input: `retail_bronze.online_retail_raw` (all strings). Outputs:
-# MAGIC - `retail_silver.sales_lines`: typed, valid, deduplicated invoice lines (one row per invoice line)
-# MAGIC - `retail_silver.sales_lines_quarantine`: rows that failed at least one rule, with the list of failed rules
+# MAGIC Bronze is append-only, so silver reads it as a **Delta streaming source**: each stream's
+# MAGIC checkpoint records which bronze versions it has processed, and `trigger(availableNow=True)`
+# MAGIC processes only what is new. The cleaning and validation rules live in `silver_rules`.
 # MAGIC
-# MAGIC Nothing is silently dropped: every bronze row ends up in exactly one of
-# MAGIC **silver**, **quarantine** or the **duplicate** count, and the notebook asserts that.
-# MAGIC
-# MAGIC | Step | What | Why |
+# MAGIC | Stream | Sink | How reruns stay idempotent |
 # MAGIC |---|---|---|
-# MAGIC | Types | `try_cast` / `try_to_timestamp` instead of `cast` | ANSI mode is on in serverless: a bad value in `cast` fails the whole job; `try_` returns NULL so a rule can catch it |
-# MAGIC | Text | trim, collapse spaces, upper-case invoice and stock code | `85123a` and `85123A` are the same product |
-# MAGIC | Flags | `is_cancelled`, `is_guest`, `is_non_merchandise` | cancellations and guest checkouts are business facts, so they are flagged, not removed |
-# MAGIC | Rules | see `RULES` below | invalid rows go to quarantine with the reasons |
-# MAGIC | Dedup | exact duplicates on all business columns | the two source sheets overlap (2010-12-01 to 2010-12-09) and the source repeats some lines |
+# MAGIC | Valid sales lines | `sales_lines` via `foreachBatch` | dedup inside the micro-batch, then an **insert-only `MERGE` on `line_id`**: a replayed batch inserts nothing twice, and a line already loaded from an earlier batch (the overlapping sheets) is skipped |
+# MAGIC | Rows failing a rule | `sales_lines_quarantine` (direct Delta sink) | the Delta sink commits each micro-batch once per checkpoint (exactly-once) |
+# MAGIC | Product catalog (JSON) | `product_catalog` and `product_price_history` via `foreachBatch` | `MERGE` on `stock_code` (latest document wins, SCD Type 1) and on `(stock_code, valid_from)` |
+# MAGIC
+# MAGIC `foreachBatch` only guarantees at-least-once delivery, which is why its writes are `MERGE`s
+# MAGIC keyed on natural keys rather than appends.
 
 # COMMAND ----------
 
@@ -23,148 +21,152 @@
 
 # COMMAND ----------
 
+# MAGIC %run ./silver_rules
+
+# COMMAND ----------
+
 from pyspark.sql import Window
 from pyspark.sql import functions as F
 
-# Stock codes that are services, fees or adjustments rather than merchandise (found by profiling).
-NON_MERCHANDISE_CODES = [
-    "POST", "DOT", "M", "C2", "D", "S", "B", "BANK CHARGES", "ADJUST", "ADJUST2",
-    "AMAZONFEE", "PADS", "CRUK", "TEST001", "TEST002",
-]
 
-bronze = spark.table(T_BRONZE)
+def table_count(table):
+    return spark.table(table).count() if spark.catalog.tableExists(table) else 0
 
-typed = bronze.select(
-    F.upper(F.trim("invoice")).alias("invoice_no"),
-    F.upper(F.trim("stock_code")).alias("stock_code"),
-    F.expr("nullif(trim(regexp_replace(description, '\\\\s+', ' ')), '')").alias("description"),
-    F.expr("try_cast(trim(quantity) AS INT)").alias("quantity"),
-    F.expr("try_to_timestamp(trim(invoice_date), 'yyyy-MM-dd HH:mm:ss')").alias("invoice_ts"),
-    F.expr("try_cast(trim(price) AS DECIMAL(12,3))").alias("unit_price"),
-    F.expr("try_cast(trim(customer_id) AS INT)").alias("customer_id"),
-    F.expr("nullif(trim(customer_id), '')").alias("_raw_customer_id"),
-    F.trim("country").alias("country"),
-    "_source_file",
-    "_ingested_at",
-)
 
-flagged = (
-    typed.withColumn("is_cancelled", F.col("invoice_no").startswith("C"))
-    .withColumn("is_guest", F.col("customer_id").isNull())
-    .withColumn(
-        "is_non_merchandise",
-        F.col("stock_code").isin(NON_MERCHANDISE_CODES) | F.col("stock_code").startswith("GIFT_"),
+def ensure_table(df, table):
+    """Create an empty Delta table with the DataFrame's schema if it does not exist yet."""
+    if not spark.catalog.tableExists(table):
+        df.limit(0).write.format("delta").saveAsTable(table)
+
+
+counts_before = {t: table_count(t) for t in (T_SILVER, T_QUARANTINE, T_SILVER_CATALOG, T_SILVER_PRICES)}
+
+# COMMAND ----------
+
+# MAGIC %md ## Sales lines
+
+# COMMAND ----------
+
+if spark.catalog.tableExists(T_BRONZE):
+    ensure_table(to_silver(validate(spark.table(T_BRONZE))), T_SILVER)
+    checked = validate(spark.readStream.table(T_BRONZE))
+
+    def merge_valid(batch_df, batch_id):
+        batch = dedup(to_silver(batch_df.filter(F.size("failed_rules") == 0)))
+        batch.createOrReplaceTempView("silver_batch")
+        batch.sparkSession.sql(f"""
+            MERGE INTO {T_SILVER} t
+            USING silver_batch s
+            ON t.line_id = s.line_id
+            WHEN NOT MATCHED THEN INSERT *
+        """)
+
+    (
+        checked.writeStream.foreachBatch(merge_valid)
+        .option("checkpointLocation", f"{CHECKPOINTS}/silver_sales")
+        .trigger(availableNow=True)
+        .start()
+        .awaitTermination()
     )
-    .withColumn("line_amount", (F.col("quantity") * F.col("unit_price")).cast("decimal(18,3)"))
-)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Validation rules
-# MAGIC A row that matches any rule goes to quarantine. Missing `customer_id` is **not** a rule:
-# MAGIC those are guest sales (about 22% of silver lines) and stay in silver with `is_guest = true`.
-# MAGIC In gold they map to the "Unknown customer" member.
-
-# COMMAND ----------
-
-RULES = {
-    "missing_invoice_no": "invoice_no IS NULL",
-    "invalid_invoice_no": "invoice_no NOT RLIKE '^C?[0-9]{6}$'",  # e.g. 'A' bad-debt adjustments
-    "missing_stock_code": "stock_code IS NULL",
-    "invalid_invoice_date": "invoice_ts IS NULL",
-    "invalid_quantity": "quantity IS NULL OR quantity = 0",
-    "invalid_price": "unit_price IS NULL OR unit_price < 0",
-    "zero_price": "unit_price = 0",  # free items / stock adjustments, not sales
-    "invalid_customer_id": "_raw_customer_id IS NOT NULL AND customer_id IS NULL",
-    "missing_country": "country IS NULL OR country = ''",
-    "negative_qty_not_cancelled": "quantity < 0 AND NOT is_cancelled",  # stock write-offs
-    "positive_qty_cancelled": "quantity > 0 AND is_cancelled",
-}
-
-failed_rules = F.array_compact(
-    F.array(*[F.when(F.expr(cond), F.lit(name)) for name, cond in RULES.items()])
-)
-checked = flagged.withColumn("failed_rules", failed_rules)
-
-valid = checked.filter(F.size("failed_rules") == 0).drop("failed_rules", "_raw_customer_id")
-quarantine = checked.filter(F.size("failed_rules") > 0).withColumn(
-    "_quarantined_at", F.current_timestamp()
-)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Deduplication and line id
-# MAGIC Exact duplicates on all business columns are removed, keeping the copy from the earliest file.
-# MAGIC Assumption (documented in the README): the source has no line number, so two identical lines
-# MAGIC on the same invoice at the same second are treated as one line.
-
-# COMMAND ----------
-
-BUSINESS_COLS = [
-    "invoice_no", "stock_code", "description", "quantity",
-    "invoice_ts", "unit_price", "customer_id", "country",
-]
-
-w = Window.partitionBy(*BUSINESS_COLS).orderBy("_source_file")
-deduped = (
-    valid.withColumn("_rn", F.row_number().over(w))
-    .filter("_rn = 1")
-    .drop("_rn")
-    .withColumn(
-        "line_id",  # deterministic natural key of the line, unique after dedup
-        F.sha2(
-            F.concat_ws("||", *[F.coalesce(F.col(c).cast("string"), F.lit("<null>")) for c in BUSINESS_COLS]),
-            256,
-        ),
+    (
+        checked.filter(F.size("failed_rules") > 0)
+        .withColumn("_quarantined_at", F.current_timestamp())
+        .writeStream.option("checkpointLocation", f"{CHECKPOINTS}/silver_quarantine")
+        .trigger(availableNow=True)
+        .toTable(T_QUARANTINE)
+        .awaitTermination()
     )
-    .withColumn("invoice_date", F.to_date("invoice_ts"))
-)
-
-silver = deduped.select(
-    "line_id", "invoice_no", "invoice_ts", "invoice_date", "stock_code", "description",
-    "quantity", "unit_price", "line_amount", "customer_id", "country",
-    "is_cancelled", "is_guest", "is_non_merchandise", "_source_file", "_ingested_at",
-)
-
-silver.write.format("delta").mode("overwrite").option("overwriteSchema", True).saveAsTable(T_SILVER)
-quarantine.write.format("delta").mode("overwrite").option("overwriteSchema", True).saveAsTable(T_QUARANTINE)
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Reconciliation: bronze = silver + quarantine + duplicates removed
+# MAGIC ## Product catalog: flatten the nested JSON
+# MAGIC Structs become columns (`attributes.category` -> `category`); the `price_history` array is exploded
+# MAGIC into one row per price. `category`, `is_seasonal` and `tags` are **synthetic** (keyword rules on
+# MAGIC the description, see `scripts/make_landing_batches.py`); `tags` only exists from catalog batch 3
+# MAGIC on, so it is NULL for earlier products.
+
 
 # COMMAND ----------
 
-n_bronze = spark.table(T_BRONZE).count()
-n_silver = spark.table(T_SILVER).count()
-n_quarantine = spark.table(T_QUARANTINE).count()
-n_valid = n_bronze - n_quarantine
-n_duplicates = n_valid - n_silver
 
-rule_counts = (
-    spark.table(T_QUARANTINE)
-    .select(F.explode("failed_rules").alias("rule"))
-    .groupBy("rule").count().orderBy(F.desc("count"))
-)
-display(rule_counts)
+def flatten_catalog(df):
+    tags = F.col("tags") if "tags" in df.columns else F.lit(None).cast("array<string>")
+    return df.select(
+        F.upper(F.trim("stock_code")).alias("stock_code"),
+        F.col("name").alias("product_name"),
+        F.col("attributes.category").alias("category"),
+        F.col("attributes.is_seasonal").cast("boolean").alias("is_seasonal"),
+        tags.alias("tags"),
+        F.size("aliases").alias("alias_count"),
+        F.to_date("first_sold_date").alias("first_sold_date"),
+        F.size("price_history").alias("price_points"),
+        "_source_file",
+        "_ingested_at",
+    )
 
-flags = spark.table(T_SILVER).agg(
-    F.sum(F.col("is_cancelled").cast("int")).alias("cancelled"),
-    F.sum(F.col("is_guest").cast("int")).alias("guest"),
-    F.sum(F.col("is_non_merchandise").cast("int")).alias("non_merchandise"),
-).first()
 
-assert n_silver + n_quarantine + n_duplicates == n_bronze, "Row reconciliation failed"
-assert spark.table(T_SILVER).select("line_id").distinct().count() == n_silver, "line_id not unique"
+def explode_prices(df):
+    return df.select(
+        F.upper(F.trim("stock_code")).alias("stock_code"), F.explode("price_history").alias("p"), "_ingested_at"
+    ).select(
+        "stock_code",
+        F.to_date("p.valid_from").alias("valid_from"),
+        F.col("p.unit_price").cast("decimal(12,3)").alias("unit_price"),
+        "_ingested_at",
+    )
 
-rules_txt = ",".join(f"{r['rule']}:{r['count']}" for r in rule_counts.collect())
+
+if spark.catalog.tableExists(T_BRONZE_CATALOG):
+    bronze_catalog = spark.table(T_BRONZE_CATALOG)
+    ensure_table(flatten_catalog(bronze_catalog), T_SILVER_CATALOG)
+    ensure_table(explode_prices(bronze_catalog), T_SILVER_PRICES)
+
+    def merge_catalog(batch_df, batch_id):
+        session = batch_df.sparkSession
+        latest = (
+            flatten_catalog(batch_df)
+            .withColumn(
+                "_rn",
+                F.row_number().over(
+                    Window.partitionBy("stock_code").orderBy(F.desc("_ingested_at"), F.desc("_source_file"))
+                ),
+            )
+            .filter("_rn = 1")
+            .drop("_rn")
+        )
+        latest.createOrReplaceTempView("catalog_batch")
+        session.sql(f"""
+            MERGE INTO {T_SILVER_CATALOG} t USING catalog_batch s ON t.stock_code = s.stock_code
+            WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *
+        """)
+        explode_prices(batch_df).dropDuplicates(["stock_code", "valid_from"]).createOrReplaceTempView("price_batch")
+        session.sql(f"""
+            MERGE INTO {T_SILVER_PRICES} t USING price_batch s
+            ON t.stock_code = s.stock_code AND t.valid_from = s.valid_from
+            WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *
+        """)
+
+    (
+        spark.readStream.table(T_BRONZE_CATALOG)
+        .writeStream.foreachBatch(merge_catalog)
+        .option("checkpointLocation", f"{CHECKPOINTS}/silver_catalog")
+        .trigger(availableNow=True)
+        .start()
+        .awaitTermination()
+    )
+
+# COMMAND ----------
+
+counts_after = {t: table_count(t) for t in counts_before}
+new = {t.split(".")[-1]: counts_after[t] - counts_before[t] for t in counts_before}
+n_bronze = table_count(T_BRONZE)
 result = (
-    f"bronze={n_bronze} silver={n_silver} quarantine={n_quarantine} duplicates_removed={n_duplicates} "
-    f"cancelled={flags['cancelled']} guest={flags['guest']} non_merchandise={flags['non_merchandise']} "
-    f"rules[{rules_txt}]"
+    f"bronze={n_bronze} silver={counts_after[T_SILVER]} (+{new['sales_lines']}) "
+    f"quarantine={counts_after[T_QUARANTINE]} (+{new['sales_lines_quarantine']}) "
+    f"duplicates_removed={n_bronze - counts_after[T_SILVER] - counts_after[T_QUARANTINE]} "
+    f"catalog={counts_after[T_SILVER_CATALOG]} (+{new['product_catalog']}) "
+    f"price_points={counts_after[T_SILVER_PRICES]} (+{new['product_price_history']})"
 )
 print(result)
 dbutils.notebook.exit(result)

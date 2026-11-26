@@ -11,6 +11,9 @@ variables:
   catalog:
     description: Unity Catalog catalog (Free Edition provides "workspace")
     default: workspace
+  env:
+    description: Environment; prod writes to retail_*, dev to retail_*_dev (schemas created by Terraform)
+    default: dev
   gold_schema:
     description: Gold schema (created by Terraform)
     default: retail_gold
@@ -42,14 +45,23 @@ resources:
       parameters:
         - name: catalog
           default: ${var.catalog}
+        - name: env
+          default: ${var.env}
       # No cluster definition: notebook tasks run on serverless compute
       # (Free Edition is serverless-only).
       tasks:
+        # Auto Loader stops on purpose with UnknownFieldException when a new JSON field appears
+        # (schema evolution mode addNewColumns); the retry ingests it with the evolved schema.
         - task_key: bronze
+          max_retries: 1
+          min_retry_interval_millis: 0
           notebook_task:
             notebook_path: ./notebooks/01_bronze.py
+        # A Delta streaming source also restarts once after an additive schema change upstream.
         - task_key: silver
           depends_on: [{ task_key: bronze }]
+          max_retries: 1
+          min_retry_interval_millis: 0
           notebook_task:
             notebook_path: ./notebooks/02_silver.py
         - task_key: gold
@@ -66,7 +78,9 @@ resources:
           # Databricks generates the dbt profile and injects the run-as user's token.
           dbt_task:
             project_directory: ${workspace.file_path}/dbt
-            commands: ["dbt source freshness", "dbt build"]
+            commands:
+              - "dbt source freshness --vars '{env: ${var.env}}'"
+              - "dbt build --vars '{env: ${var.env}}'"
             warehouse_id: ${var.warehouse_id}
             catalog: ${var.catalog}
             schema: ${var.marts_schema}
@@ -82,6 +96,10 @@ targets:
   # Local development, deployed by a user with `-p <profile>`.
   dev:
     default: true
+    variables:
+      env: dev
+      gold_schema: retail_gold_dev
+      marts_schema: retail_marts_dev
 
   # Deployed only by GitHub Actions as the github-ci service principal (OAuth M2M).
   # CI sets BUNDLE_VAR_ci_service_principal from the DATABRICKS_CLIENT_ID secret, so the root is
@@ -89,6 +107,8 @@ targets:
   # and the job runs as the service principal.
   prod:
     mode: production
+    variables:
+      env: prod
     workspace:
       root_path: /Workspace/Users/${var.ci_service_principal}/.bundle/${bundle.name}/${bundle.target}
     run_as:

@@ -11,19 +11,32 @@
 # COMMAND ----------
 
 dbutils.widgets.text("catalog", "workspace")
+dbutils.widgets.text("env", "dev")  # "prod" (CI deployment) or "dev" (developer deployment)
 CATALOG = dbutils.widgets.get("catalog")
+ENV = dbutils.widgets.get("env")
+assert ENV in ("prod", "dev"), f"env must be prod or dev, got {ENV!r}"
+SUFFIX = "" if ENV == "prod" else "_dev"  # dev writes to its own *_dev schemas (Terraform)
 
-BRONZE = f"{CATALOG}.retail_bronze"
-SILVER = f"{CATALOG}.retail_silver"
-GOLD = f"{CATALOG}.retail_gold"
+BRONZE = f"{CATALOG}.retail_bronze{SUFFIX}"
+SILVER = f"{CATALOG}.retail_silver{SUFFIX}"
+GOLD = f"{CATALOG}.retail_gold{SUFFIX}"
 
-LANDING_VOLUME = f"{BRONZE}.landing"
-RAW_PATH = f"/Volumes/{CATALOG}/retail_bronze/landing/online_retail_ii/"
+# Raw files land once, in the prod landing volume; both environments only read them.
+LANDING_VOLUME = f"{CATALOG}.retail_bronze.landing"
+LANDING = f"/Volumes/{CATALOG}/retail_bronze/landing"
+SALES_LANDING = f"{LANDING}/online_retail_ii_weekly/"
+CATALOG_LANDING = f"{LANDING}/product_catalog/"
+# Streaming checkpoints and Auto Loader schema locations: one folder per stream.
+CHECKPOINTS_VOLUME = f"{BRONZE}.checkpoints"
+CHECKPOINTS = f"/Volumes/{CATALOG}/retail_bronze{SUFFIX}/checkpoints"
 
 # Tables
 T_BRONZE = f"{BRONZE}.online_retail_raw"
+T_BRONZE_CATALOG = f"{BRONZE}.product_catalog_raw"
 T_SILVER = f"{SILVER}.sales_lines"
 T_QUARANTINE = f"{SILVER}.sales_lines_quarantine"
+T_SILVER_CATALOG = f"{SILVER}.product_catalog"
+T_SILVER_PRICES = f"{SILVER}.product_price_history"
 T_DIM_DATE = f"{GOLD}.dim_date"
 T_DIM_PRODUCT = f"{GOLD}.dim_product"
 T_DIM_CUSTOMER = f"{GOLD}.dim_customer"
@@ -43,7 +56,8 @@ existing_schemas = {r[0] for r in spark.sql(f"SHOW SCHEMAS IN {CATALOG}").collec
 missing = [s for s in (BRONZE, SILVER, GOLD) if s.split(".")[1] not in existing_schemas]
 if missing:
     raise RuntimeError(f"Missing schemas {missing}: create them with Terraform (terraform/) first.")
-existing_volumes = {r[1] for r in spark.sql(f"SHOW VOLUMES IN {BRONZE}").collect()}
-if LANDING_VOLUME.split(".")[-1] not in existing_volumes:
-    raise RuntimeError(f"Missing volume {LANDING_VOLUME}: create it with Terraform (terraform/) first.")
-print(f"catalog={CATALOG} raw_path={RAW_PATH}")
+for volume in (LANDING_VOLUME, CHECKPOINTS_VOLUME):
+    schema_name, volume_name = volume.split(".")[1:]
+    if volume_name not in {r[1] for r in spark.sql(f"SHOW VOLUMES IN {CATALOG}.{schema_name}").collect()}:
+        raise RuntimeError(f"Missing volume {volume}: create it with Terraform (terraform/) first.")
+print(f"env={ENV} catalog={CATALOG} bronze={BRONZE} silver={SILVER} gold={GOLD}")

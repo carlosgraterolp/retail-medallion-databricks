@@ -1,8 +1,10 @@
 """Write a Markdown summary of the latest pipeline run (for $GITHUB_STEP_SUMMARY).
 
-Uses the Databricks CLI with the credentials already in the environment. Prints task states,
-durations and each notebook's result line, plus the dbt result line. It never prints URLs,
-hosts or identities. Exits non-zero if any task did not succeed.
+Uses the Databricks CLI with the credentials already in the environment. Prints, per task, the
+final attempt's state, duration and result line (notebook exit value or the dbt result line) and
+how many retries it took. The Jobs API lists every attempt; a task that failed and then succeeded
+on retry counts as succeeded, like the run itself. It never prints URLs, hosts or identities.
+Exits non-zero if the run or any task's final attempt did not succeed.
 
 usage: python3 scripts/ci_run_summary.py --target prod
 """
@@ -34,14 +36,30 @@ def main():
     run = cli("jobs", "get-run", str(runs[0]["run_id"]))
 
     print("## Pipeline run\n")
-    print(f"Result: **{run['state'].get('result_state', run['state'].get('life_cycle_state'))}**\n")
-    print("| Task | State | Duration | Result |")
-    print("|---|---|---|---|")
+    run_state = run["state"].get("result_state", run["state"].get("life_cycle_state"))
+    print(f"Result: **{run_state}**\n")
+    print("| Task | State | Retries | Duration | Result |")
+    print("|---|---|---|---|---|")
     order = ["bronze", "silver", "gold", "quality_checks", "dbt_marts"]
-    tasks = sorted(run["tasks"], key=lambda t: order.index(t["task_key"]) if t["task_key"] in order else 99)
-    failed = False
+    attempts, retried_after = {}, {}
+    for t in run["tasks"]:  # one entry per attempt; keep the latest attempt of each task
+        key = t["task_key"]
+        if key not in attempts or t.get("attempt_number", 0) > attempts[key].get("attempt_number", 0):
+            attempts[key] = t
+    for t in run["tasks"]:  # earlier attempts: keep the error class that caused the retry
+        key = t["task_key"]
+        if t is not attempts[key]:
+            try:
+                error = cli("jobs", "get-run-output", str(t["run_id"])).get("error") or ""
+            except subprocess.CalledProcessError:
+                error = ""
+            classes = [part.split("]")[0] for part in error.split("[")[1:] if part.split("]")[0].isupper()]
+            retried_after[key] = classes[-1] if classes else "error"
+    tasks = sorted(attempts.values(), key=lambda t: order.index(t["task_key"]) if t["task_key"] in order else 99)
+    failed = run_state != "SUCCESS"
     for t in tasks:
         state = t["state"].get("result_state", t["state"].get("life_cycle_state"))
+        retries = t.get("attempt_number", 0)
         failed |= state != "SUCCESS"
         seconds = round((t.get("execution_duration") or 0) / 1000)
         detail = ""
@@ -56,8 +74,10 @@ def main():
                 detail = output["error"].splitlines()[0][:300]
         except subprocess.CalledProcessError:
             detail = "(output not available)"
+        if t["task_key"] in retried_after:
+            detail = f"retried after {retried_after[t['task_key']]}; final attempt: {detail}"
         detail = detail.replace("|", "\\|")
-        print(f"| {t['task_key']} | {state} | {seconds} s | {detail} |")
+        print(f"| {t['task_key']} | {state} | {retries} | {seconds} s | {detail} |")
     return 1 if failed else 0
 
 

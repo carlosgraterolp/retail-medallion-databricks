@@ -10,6 +10,8 @@ target-path: target
 clean-targets: ["target", "dbt_packages"]
 
 vars:
+  # dev (default, safe for local runs): reads *_dev schemas; the prod job passes --vars '{env: prod}'.
+  env: dev
   # Analysis date for RFM recency: the day after the last invoice in the dataset.
   rfm_snapshot_date: "2011-12-10"
   # Incremental demo: set to a date to simulate that data only arrived up to that day.

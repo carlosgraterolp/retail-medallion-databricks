@@ -79,3 +79,12 @@ models:
         description: Distinct identified customers (guests not counted).
       - name: _processed_at
         description: When the row was last written by dbt (shows which days an incremental run touched).
+
+  - name: mart_category_performance
+    description: >
+      One row per SYNTHETIC product category. Joins the semi-structured catalog (JSON, flattened in
+      silver) to the sales fact. Categories come from keyword rules on the description, so the
+      figures demonstrate the modelling and are NOT business findings.
+    columns:
+      - name: synthetic_category
+        data_tests: [unique, not_null]

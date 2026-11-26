@@ -4,7 +4,7 @@ sources:
   - name: gold
     description: Kimball star schema built by the Spark notebooks (03_gold). dbt only reads it.
     database: workspace
-    schema: retail_gold
+    schema: "retail_gold{{ '' if var('env') == 'prod' else '_dev' }}"
     tables:
       - name: fact_sales
         description: "Grain: one invoice line. line_amount is negative for cancellations."
@@ -56,3 +56,19 @@ sources:
         description: One row per invoice country; country_key = -1 is unknown.
       - name: dim_date
         description: Generated calendar, key yyyymmdd.
+
+  - name: silver
+    description: Silver tables used by dbt (the product catalog, flattened from semi-structured JSON).
+    database: workspace
+    schema: "retail_silver{{ '' if var('env') == 'prod' else '_dev' }}"
+    tables:
+      - name: product_catalog
+        description: >
+          One row per merchandise product, flattened from the JSON catalog feed (Auto Loader,
+          schema evolution). name and price history are derived from real transactions;
+          category, is_seasonal and tags are SYNTHETIC (keyword rules on the description).
+        columns:
+          - name: stock_code
+            data_tests: [unique, not_null]
+      - name: product_price_history
+        description: One row per product and price, exploded from the JSON price_history array.
