@@ -2,7 +2,8 @@
 
 Preguntas probables sobre este proyecto, con respuestas cortas basadas en lo que construí.
 Cifras de la última corrida: bronze 1.067.371 filas → silver 1.027.015 + cuarentena 6.209 +
-duplicados 34.147; `fact_sales` 1.027.015; 33/33 checks OK; ~2 min en serverless.
+duplicados 34.147; `fact_sales` 1.027.015; 33/33 checks OK; job completo (5 tareas, con dbt) ~4 min en serverless.
+Capa dbt: 5 modelos y 38 tests (43/43 OK); RFM 5.939 clientes; 4.738 productos; 3.237 filas día × país.
 
 ---
 
@@ -94,7 +95,7 @@ rechazan: son hechos de negocio y se marcan con flags.
 
 ## 13. Infraestructura como código: Bundles vs Terraform
 - **Declarative Automation Bundles** (antes Databricks Asset Bundles): YAML (`databricks.yml`) que
-  versiona en Git los recursos *del proyecto*: aquí esquemas, volumen y el job con sus 4 tareas.
+  versiona en Git los recursos *del proyecto*: aquí 4 esquemas, el volumen, el job con sus 5 tareas (4 notebooks + dbt) y el dashboard.
   `bundle deploy` crea/actualiza, `bundle run` ejecuta. Pensado para el ciclo de desarrollo de
   datos (targets dev/prod, despliegue del código junto a la definición).
 - **Terraform** (provider de Databricks): para la *plataforma*: workspaces, metastore, permisos,
@@ -111,11 +112,78 @@ Gobierno centralizado con espacio de nombres de 3 niveles `catálogo.esquema.tab
 (`workspace.retail_gold.fact_sales`). Los archivos viven en **volúmenes** (`/Volumes/...`) en lugar
 de DBFS. Da permisos, linaje y auditoría en un solo lugar.
 
-## 16. ¿Qué mejorarías? (siguientes pasos)
-1. Modelos **dbt** sobre gold (tests declarativos, documentación, linaje).
+## 16. ¿Por qué dbt encima de notebooks de Spark? (dbt vs notebooks)
+Cada herramienta donde rinde más. **Spark/notebooks**: ingesta de archivos, tipado, deduplicación,
+cuarentena, el esquema estrella; trabajo pesado y orientado a archivos. **dbt**: modelado de negocio
+en SQL que un analista puede leer y revisar, con tests y documentación al lado de cada modelo, y
+linaje automático. dbt solo **lee** gold (declarado como `sources`) y escribe en su propio esquema,
+`retail_marts`. En el job, `dbt_marts` es la quinta tarea: un `dbt_task` en serverless contra el SQL
+warehouse; Databricks genera el profile e inyecta el token del usuario, no guardo credenciales.
+
+## 17. `ref()` vs `source()`
+- `source('gold', 'fact_sales')`: tablas que **no** construye dbt (aquí, las de los notebooks).
+  Se declaran en `sources.yml` con descripción, tests y freshness.
+- `ref('stg_sales')`: otro modelo **de dbt**. dbt arma el DAG con los `ref`, ejecuta en orden y
+  resuelve el nombre real (catálogo/esquema) según el target.
+- Ambos alimentan el linaje; hardcodear `workspace.retail_gold.fact_sales` rompería las dos cosas.
+
+## 18. Materializaciones: view, table, incremental (¿cuándo cada una?)
+- **view**: barata, siempre actual, se recalcula al consultarla. Para staging ligero
+  (`stg_sales`, `stg_customers`).
+- **table**: se recrea completa en cada `dbt run`. Para marts que se consultan mucho y cuyo costo de
+  recálculo es bajo (`mart_customer_rfm`, `mart_product_performance`). Además RFM *necesita* recalcularse
+  entero: `percent_rank` depende de todos los clientes.
+- **incremental**: solo procesa lo nuevo o cambiado. Para tablas grandes que crecen con el tiempo,
+  con una clave clara (`mart_daily_sales`, por día y país).
+- (**ephemeral**: CTE inyectada, no se materializa. No la usé.)
+
+## 19. Estrategias incrementales (dbt-databricks)
+- **merge** (la que usé, default en Delta): `MERGE` por `unique_key` = `(sale_date, country)`.
+  Actualiza filas existentes e inserta nuevas; idempotente si reproceso un día.
+- **append**: solo inserta; rápido pero duplica si reproceso.
+- **insert_overwrite** / **replace_where**: reemplaza particiones o un rango (p. ej. "los últimos 3 días").
+- **delete+insert** y **microbatch** (por lotes de tiempo).
+- **Ventana de reproceso (`lookback_days` = 3)**: cada corrida reprocesa desde (última fecha cargada
+  − 3 días) hasta la fecha más nueva, **ambos extremos incluidos**: son **4 días** ya cargados (la última
+  fecha y los 3 anteriores) más los días nuevos. Así capto correcciones tardías (una cancelación días después).
+- Demo (simulada, la fuente es estática): corrida 1 con `cutoff_date = 2011-11-30` → 3.178 filas;
+  corrida 2 → escribe **85 filas** (12 días, 27/11 a 9/12: 4 reprocesados + 8 nuevos); corrida 3 sin
+  datos nuevos → **31 filas** (los 4 días reprocesados, 6/12 a 9/12). El total cuadra con `fact_sales` al centavo (£19.002.774,21).
+- `is_incremental()` es falso en la primera corrida o con `--full-refresh`.
+
+## 20. Tests genéricos vs singulares
+- **Genéricos**: reutilizables y parametrizados en YAML: `unique`, `not_null`, `relationships`,
+  `accepted_values`. Tengo 34 (claves, relaciones fact → dims, segmentos válidos).
+- **Singulares**: un SELECT en `tests/` que devuelve las filas que violan la regla; pasa si devuelve 0.
+  Tengo 4: el mart diario cuadra con `fact_sales`; todo cliente no invitado está en RFM; el segmento
+  "No net value" es exactamente monetary <= 0 y sin scores; las participaciones del Pareto suman 100%.
+- Me salvaron dos veces: en Spark `least(5, NULL) = 5` (ignora NULLs), y había dado score 5 a clientes
+  sin valor; y mi primer test de Pareto suponía mal que el acumulado nunca pasa de 100% (33 productos
+  con ingreso neto <= 0 al final del ranking lo hacen subir y bajar).
+- Además: **source freshness** sobre `_loaded_at` (avisa a los 7 días, solo warn).
+
+## 21. ¿Por qué RFM y cómo definiste los segmentos?
+- RFM (Recency, Frequency, Monetary) es simple, explicable y accionable: dice a quién retener y a quién
+  premiar, sin un modelo de ML.
+- **R** = días desde la última compra hasta 2011-12-10 (día siguiente a la última factura, no "hoy",
+  porque los datos son históricos). **F** = facturas no canceladas. **M** = ingreso neto.
+- **Empates**: `score = least(5, 1 + floor(percent_rank * 5))`. `percent_rank` da el mismo rango a
+  valores iguales, así que clientes empatados reciben el **mismo** score. Con `NTILE(5)` los 1.593
+  clientes de una sola factura habrían caído en buckets distintos de forma arbitraria. Costo: los
+  grupos no tienen el mismo tamaño.
+- **Monetary <= 0** (solo cancelaciones o compras revertidas, 102 clientes): no se puntúan, segmento
+  "No net value". Los mantengo para que todo cliente aparezca (y un test lo exige).
+- Segmentos (primera regla que cumple, sobre R y F): Champions (R>=4, F>=4), Loyal (R>=3, F>=3),
+  New (R>=4), Potential loyalist (R=3), At risk (R<=2, F>=3), Lost (el resto). M se reporta para priorizar.
+- **Hallazgos**: Champions = 23,4% de los clientes identificados y **70,1%** de su ingreso neto
+  (£11,41M de £16,29M). "At risk": 712 clientes, 5,4 compras de media pero ~358 días sin comprar,
+  £1,33M: el objetivo obvio de retención. Pareto: **21,9%** de los productos (1.038 de 4.738) hacen el 80%.
+
+## 22. ¿Qué mejorarías? (siguientes pasos)
+1. ~~Modelos dbt sobre gold~~ (hecho).
 2. **Terraform** para los recursos del workspace.
-3. **CI con GitHub Actions**: validar el bundle y correr los checks de calidad en cada PR.
-4. Carga incremental (Auto Loader / `MERGE` por fecha) y SCD2 en `dim_customer`.
+3. **CI con GitHub Actions**: validar el bundle, `dbt build` y los checks de calidad en cada PR.
+4. SCD2 en `dim_customer` (snapshots de dbt) e ingesta incremental real en bronze (Auto Loader).
 
 ## Preguntas trampa
 - *"¿Por qué hay 22% de ventas sin cliente y no las eliminaste?"*: son ventas reales (compras como

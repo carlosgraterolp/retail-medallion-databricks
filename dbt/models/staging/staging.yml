@@ -1,0 +1,23 @@
+version: 2
+
+models:
+  - name: stg_sales
+    description: Invoice lines from fact_sales with business names, sale_date and gross/cancelled amounts.
+    columns:
+      - name: line_id
+        data_tests: [unique, not_null]
+      - name: sale_date
+        data_tests: [not_null]
+      - name: net_amount
+        description: GBP; negative for cancellation lines.
+      - name: gross_amount
+        description: GBP of sales lines (0 for cancellation lines).
+      - name: cancelled_amount
+        description: Positive GBP of cancellation lines (0 for sales lines).
+  - name: stg_customers
+    description: Identified customers (guest/unknown member removed).
+    columns:
+      - name: customer_key
+        data_tests: [unique, not_null]
+      - name: customer_id
+        data_tests: [unique, not_null]

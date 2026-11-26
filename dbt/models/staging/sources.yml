@@ -1,0 +1,58 @@
+version: 2
+
+sources:
+  - name: gold
+    description: Kimball star schema built by the Spark notebooks (03_gold). dbt only reads it.
+    database: workspace
+    schema: retail_gold
+    tables:
+      - name: fact_sales
+        description: "Grain: one invoice line. line_amount is negative for cancellations."
+        config:
+          loaded_at_field: _loaded_at
+          freshness:
+            # The pipeline runs on demand, so a stale gold layer is a warning, not an error.
+            warn_after: { count: 7, period: day }
+        columns:
+          - name: line_id
+            description: SHA-256 of all business columns of the line (natural key from silver).
+            data_tests: [unique, not_null]
+          - name: invoice_no
+            description: Invoice number (degenerate dimension). Starts with C for cancellations.
+          - name: date_key
+            data_tests:
+              - relationships:
+                  arguments:
+                    to: "source('gold', 'dim_date')"
+                    field: date_key
+          - name: product_key
+            data_tests:
+              - relationships:
+                  arguments:
+                    to: "source('gold', 'dim_product')"
+                    field: product_key
+          - name: customer_key
+            description: -1 = guest (no customer id on the invoice).
+            data_tests:
+              - relationships:
+                  arguments:
+                    to: "source('gold', 'dim_customer')"
+                    field: customer_key
+          - name: country_key
+            data_tests:
+              - relationships:
+                  arguments:
+                    to: "source('gold', 'dim_country')"
+                    field: country_key
+          - name: line_amount
+            description: quantity x unit_price, in GBP.
+          - name: _loaded_at
+            description: When 03_gold rebuilt the fact (used for source freshness).
+      - name: dim_product
+        description: "SCD Type 1. One row per stock code; product_key = -1 is the unknown member."
+      - name: dim_customer
+        description: "SCD Type 1. One row per customer; customer_key = -1 is guest/unknown."
+      - name: dim_country
+        description: One row per invoice country; country_key = -1 is unknown.
+      - name: dim_date
+        description: Generated calendar, key yyyymmdd.

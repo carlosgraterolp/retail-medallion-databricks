@@ -29,6 +29,10 @@ resources:
       catalog_name: ${var.catalog}
       name: retail_gold
       comment: Kimball star schema, aggregates and data quality results
+    marts:
+      catalog_name: ${var.catalog}
+      name: retail_marts
+      comment: Business marts built by dbt on top of the gold layer
 
   volumes:
     landing:
@@ -72,6 +76,23 @@ resources:
           depends_on: [{ task_key: gold }]
           notebook_task:
             notebook_path: ./notebooks/04_quality_checks.py
+        - task_key: dbt_marts
+          depends_on: [{ task_key: quality_checks }]
+          # dbt Core runs on serverless compute against the SQL warehouse;
+          # Databricks generates the dbt profile and injects the run-as user's token.
+          dbt_task:
+            project_directory: ${workspace.file_path}/dbt
+            commands: ["dbt source freshness", "dbt build"]
+            warehouse_id: ${var.warehouse_id}
+            catalog: ${var.catalog}
+            schema: ${resources.schemas.marts.name}
+          environment_key: dbt
+      environments:
+        - environment_key: dbt
+          spec:
+            environment_version: "4"
+            dependencies:
+              - dbt-databricks==1.13.1
 
 targets:
   dev:

@@ -1,0 +1,15 @@
+# Copy to ~/.dbt/profiles.yml (never commit the real file) and set the two env vars,
+# or replace them with your values. Authentication is OAuth in the browser: no token here.
+#   export DATABRICKS_HOST=<your-workspace>.cloud.databricks.com
+#   export DATABRICKS_HTTP_PATH=/sql/1.0/warehouses/<warehouse-id>
+retail_medallion:
+  target: dev
+  outputs:
+    dev:
+      type: databricks
+      auth_type: oauth
+      host: "{{ env_var('DATABRICKS_HOST') }}"
+      http_path: "{{ env_var('DATABRICKS_HTTP_PATH') }}"
+      catalog: workspace
+      schema: retail_marts
+      threads: 4

@@ -1,0 +1,81 @@
+version: 2
+
+models:
+  - name: mart_customer_rfm
+    description: >
+      One row per identified customer (guests excluded) with recency, frequency, monetary value,
+      R/F/M scores and a segment. {{ doc('rfm_rules') }}
+    columns:
+      - name: customer_key
+        data_tests:
+          - unique
+          - not_null
+          - relationships:
+              arguments:
+                to: "ref('stg_customers')"
+                field: customer_key
+      - name: customer_id
+        data_tests: [unique, not_null]
+      - name: monetary
+        description: Net revenue in GBP (sales minus cancellations).
+      - name: r_score
+        description: 1-5, NULL when segment = 'No net value'.
+        data_tests:
+          - not_null:
+              config: { where: "segment <> 'No net value'" }
+          - accepted_values:
+              arguments: { values: [1, 2, 3, 4, 5], quote: false }
+      - name: f_score
+        data_tests:
+          - not_null:
+              config: { where: "segment <> 'No net value'" }
+      - name: m_score
+        data_tests:
+          - not_null:
+              config: { where: "segment <> 'No net value'" }
+      - name: segment
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['Champions', 'Loyal', 'New', 'Potential loyalist', 'At risk', 'Lost', 'No net value']
+
+  - name: mart_product_performance
+    description: >
+      One row per merchandise product sold: revenue, units, invoices, cancellation rate,
+      revenue rank, share of total revenue and the Pareto flag (products that make up 80% of revenue).
+    columns:
+      - name: product_key
+        data_tests:
+          - unique
+          - not_null
+          - relationships:
+              arguments:
+                to: "source('gold', 'dim_product')"
+                field: product_key
+      - name: stock_code
+        data_tests: [unique, not_null]
+      - name: revenue_rank
+        data_tests: [not_null]
+      - name: cancellation_rate
+        description: Cancelled amount / gross sales (NULL when the product has no gross sales).
+      - name: is_top_80pct_revenue
+        description: True if the product is needed to reach 80% of total net revenue, ranking by revenue.
+
+  - name: mart_daily_sales
+    description: >
+      One row per day and invoice country: net revenue, invoices and customers. Incremental
+      (merge on sale_date + country). Each run reprocesses from (last loaded date - lookback_days)
+      through the newest date, inclusive: with lookback_days = 3, 4 already-loaded days plus any new days.
+    columns:
+      - name: daily_key
+        description: sale_date|country, the unique key of the row.
+        data_tests: [unique, not_null]
+      - name: sale_date
+        data_tests: [not_null]
+      - name: country
+        data_tests: [not_null]
+      - name: customers
+        description: Distinct identified customers (guests not counted).
+      - name: _processed_at
+        description: When the row was last written by dbt (shows which days an incremental run touched).

@@ -16,7 +16,14 @@ data/
 
 # Python / OS
 .venv/
+.venv-dbt/
 __pycache__/
 *.pyc
 .DS_Store
 .ipynb_checkpoints/
+
+# dbt artifacts
+dbt/target/
+dbt/logs/
+dbt/dbt_packages/
+dbt/.user.yml

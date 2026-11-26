@@ -162,7 +162,8 @@ fact = spark.sql(f"""
       s.quantity,
       s.unit_price,
       s.line_amount,                                           -- negative for cancellations
-      s.is_cancelled
+      s.is_cancelled,
+      current_timestamp()                                      AS _loaded_at  -- for dbt source freshness
     FROM silver_lines s
     LEFT JOIN {T_DIM_PRODUCT}  p ON p.stock_code   = s.stock_code
     LEFT JOIN {T_DIM_CUSTOMER} c ON c.customer_id  = s.customer_id
