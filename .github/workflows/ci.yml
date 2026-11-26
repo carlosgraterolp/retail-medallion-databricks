@@ -1,0 +1,76 @@
+# Pull request checks. Nothing is deployed from a pull request.
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Python lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - run: pip install ruff==0.17.6
+      - run: ruff check --output-format=github .
+
+  terraform:
+    name: Terraform fmt and validate
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.17.2
+      - run: terraform fmt -check -recursive -diff
+      # No backend and no credentials: validate only checks the configuration.
+      - run: terraform init -backend=false -input=false
+      - run: terraform validate -no-color
+
+  dbt:
+    name: dbt parse
+    runs-on: ubuntu-latest
+    env:
+      # parse does not connect to Databricks: placeholder values only.
+      DATABRICKS_HOST: placeholder.cloud.databricks.com
+      DATABRICKS_HTTP_PATH: /sql/1.0/warehouses/placeholder
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - run: pip install -r dbt/requirements.txt
+      - name: dbt parse
+        working-directory: dbt
+        run: |
+          mkdir -p "$RUNNER_TEMP/dbt-profiles"
+          cp profiles.example.yml "$RUNNER_TEMP/dbt-profiles/profiles.yml"
+          dbt parse --profiles-dir "$RUNNER_TEMP/dbt-profiles"
+
+  bundle:
+    name: Bundle validate (prod)
+    runs-on: ubuntu-latest
+    # Secrets are not available to pull requests from forks: skip there.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    env:
+      DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+      DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
+      DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+      BUNDLE_VAR_ci_service_principal: ${{ secrets.DATABRICKS_CLIENT_ID }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: databricks/setup-cli@e1dad86b08f6ea07707aea128ec4bfa76af8db55 # v1.28.0
+      - run: databricks bundle validate --strict -t prod

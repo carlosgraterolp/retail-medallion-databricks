@@ -1,12 +1,12 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # 00_setup: configuration and Unity Catalog objects
+# MAGIC # 00_setup: configuration and platform check
 # MAGIC
 # MAGIC Single place for names and paths. Every other notebook starts with `%run ./00_setup`.
 # MAGIC
-# MAGIC The schemas and the landing volume are created by the bundle (`databricks bundle deploy`).
-# MAGIC The `CREATE ... IF NOT EXISTS` statements below are idempotent, so the notebooks also work
-# MAGIC when imported and run by hand in the UI without the bundle.
+# MAGIC The schemas and the landing volume are platform resources owned by Terraform (`terraform/`).
+# MAGIC The notebooks do not create them (the CI service principal has no CREATE SCHEMA right);
+# MAGIC they only check that they exist and fail with a clear message otherwise.
 
 # COMMAND ----------
 
@@ -39,7 +39,11 @@ UNKNOWN_KEY = -1
 
 # COMMAND ----------
 
-for schema in (BRONZE, SILVER, GOLD):
-    spark.sql(f"CREATE SCHEMA IF NOT EXISTS {schema}")
-spark.sql(f"CREATE VOLUME IF NOT EXISTS {LANDING_VOLUME}")
+existing_schemas = {r[0] for r in spark.sql(f"SHOW SCHEMAS IN {CATALOG}").collect()}
+missing = [s for s in (BRONZE, SILVER, GOLD) if s.split(".")[1] not in existing_schemas]
+if missing:
+    raise RuntimeError(f"Missing schemas {missing}: create them with Terraform (terraform/) first.")
+existing_volumes = {r[1] for r in spark.sql(f"SHOW VOLUMES IN {BRONZE}").collect()}
+if LANDING_VOLUME.split(".")[-1] not in existing_volumes:
+    raise RuntimeError(f"Missing volume {LANDING_VOLUME}: create it with Terraform (terraform/) first.")
 print(f"catalog={CATALOG} raw_path={RAW_PATH}")

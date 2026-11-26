@@ -88,7 +88,7 @@ CHECKS = [
 
 # COMMAND ----------
 
-run_ts = datetime.datetime.now(datetime.timezone.utc)
+run_ts = datetime.datetime.now(datetime.UTC)
 results = []
 for name, layer, sql, expected in CHECKS:
     observed = scalar(sql)

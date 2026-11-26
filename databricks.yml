@@ -1,6 +1,7 @@
 # Declarative Automation Bundle (formerly "Databricks Asset Bundle").
-# Defines the Unity Catalog schemas, the landing volume, the pipeline job and the
-# AI/BI dashboard as code.
+# Defines the application resources: the pipeline job and the AI/BI dashboard.
+# The platform resources (schemas, landing volume, CI service principal and its grants) are
+# owned by Terraform (terraform/), so nothing is managed twice.
 # The workspace host is not committed: pass it through a CLI profile, e.g.
 #   databricks bundle deploy -p <profile>
 bundle:
@@ -10,38 +11,21 @@ variables:
   catalog:
     description: Unity Catalog catalog (Free Edition provides "workspace")
     default: workspace
+  gold_schema:
+    description: Gold schema (created by Terraform)
+    default: retail_gold
+  marts_schema:
+    description: dbt marts schema (created by Terraform)
+    default: retail_marts
+  ci_service_principal:
+    description: Application ID of the CI service principal (prod target only; set by CI)
+    default: ""
   warehouse_id:
     description: SQL warehouse for the dashboard (Free Edition provides one)
     lookup:
       warehouse: Serverless Starter Warehouse
 
 resources:
-  schemas:
-    bronze:
-      catalog_name: ${var.catalog}
-      name: retail_bronze
-      comment: Raw data as ingested, plus ingestion metadata
-    silver:
-      catalog_name: ${var.catalog}
-      name: retail_silver
-      comment: Cleaned, typed and deduplicated invoice lines; quarantine table
-    gold:
-      catalog_name: ${var.catalog}
-      name: retail_gold
-      comment: Kimball star schema, aggregates and data quality results
-    marts:
-      catalog_name: ${var.catalog}
-      name: retail_marts
-      comment: Business marts built by dbt on top of the gold layer
-
-  volumes:
-    landing:
-      catalog_name: ${var.catalog}
-      schema_name: ${resources.schemas.bronze.name}
-      name: landing
-      volume_type: MANAGED
-      comment: Raw CSV files uploaded with the Databricks CLI
-
   dashboards:
     retail_sales:
       display_name: Online Retail Sales
@@ -49,7 +33,7 @@ resources:
       warehouse_id: ${var.warehouse_id}
       # Dataset queries use bare table names; the bundle supplies catalog and schema.
       dataset_catalog: ${var.catalog}
-      dataset_schema: ${resources.schemas.gold.name}
+      dataset_schema: ${var.gold_schema}
 
   jobs:
     retail_medallion_pipeline:
@@ -85,7 +69,7 @@ resources:
             commands: ["dbt source freshness", "dbt build"]
             warehouse_id: ${var.warehouse_id}
             catalog: ${var.catalog}
-            schema: ${resources.schemas.marts.name}
+            schema: ${var.marts_schema}
           environment_key: dbt
       environments:
         - environment_key: dbt
@@ -95,5 +79,22 @@ resources:
               - dbt-databricks==1.13.1
 
 targets:
+  # Local development, deployed by a user with `-p <profile>`.
   dev:
     default: true
+
+  # Deployed only by GitHub Actions as the github-ci service principal (OAuth M2M).
+  # CI sets BUNDLE_VAR_ci_service_principal from the DATABRICKS_CLIENT_ID secret, so the root is
+  # the service principal's home (only it and admins can write there; no email in paths or logs)
+  # and the job runs as the service principal.
+  prod:
+    mode: production
+    workspace:
+      root_path: /Workspace/Users/${var.ci_service_principal}/.bundle/${bundle.name}/${bundle.target}
+    run_as:
+      service_principal_name: ${var.ci_service_principal}
+    permissions:
+      - level: CAN_MANAGE
+        group_name: admins
+      - level: CAN_MANAGE
+        service_principal_name: ${var.ci_service_principal}

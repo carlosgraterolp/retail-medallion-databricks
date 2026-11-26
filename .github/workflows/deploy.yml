@@ -1,0 +1,44 @@
+# Deploy and run on main. Authenticates as the github-ci service principal (OAuth M2M).
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One deployment at a time; never cancel a deployment that is already running.
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+jobs:
+  deploy-and-run:
+    name: Deploy bundle and run pipeline
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: prod
+    env:
+      DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+      DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
+      DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+      BUNDLE_VAR_ci_service_principal: ${{ secrets.DATABRICKS_CLIENT_ID }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: databricks/setup-cli@e1dad86b08f6ea07707aea128ec4bfa76af8db55 # v1.28.0
+
+      - name: Validate
+        run: databricks bundle validate --strict -t prod
+
+      - name: Deploy (job and dashboard)
+        run: databricks bundle deploy -t prod
+
+      # Fails the workflow if any task fails: Spark layers, the 33 quality checks or dbt build.
+      - name: Run pipeline
+        run: databricks bundle run -t prod retail_medallion_pipeline
+
+      - name: Run summary
+        if: always()
+        run: python3 scripts/ci_run_summary.py --target prod >> "$GITHUB_STEP_SUMMARY"

@@ -27,3 +27,11 @@ dbt/target/
 dbt/logs/
 dbt/dbt_packages/
 dbt/.user.yml
+
+# Terraform: state, plans, local variables and provider cache
+terraform/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+terraform/terraform.tfvars
+.terraform.lock.hcl.bak

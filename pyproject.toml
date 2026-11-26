@@ -1,0 +1,15 @@
+# Lint configuration (ruff). Used locally and in CI.
+[tool.ruff]
+target-version = "py313"
+line-length = 120
+extend-exclude = [".venv", ".venv-dbt", "dbt/target", "data"]
+# Databricks notebooks get these objects from the runtime, not from imports.
+builtins = ["spark", "dbutils", "display"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+# Notebooks: `%run ./00_setup` defines the config names, cells import after the %run cell,
+# and Markdown tables / SQL comment strings cannot be wrapped.
+"notebooks/*.py" = ["F821", "E402", "F405", "F403", "E501"]
