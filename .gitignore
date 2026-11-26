@@ -1,0 +1,22 @@
+# Raw dataset: never committed (download it with the steps in the README)
+data/
+*.csv
+*.xlsx
+*.xls
+*.zip
+*.parquet
+
+# Local config and credentials
+.databrickscfg
+.databricks/
+.env
+.env.*
+*.pem
+*.key
+
+# Python / OS
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+.ipynb_checkpoints/

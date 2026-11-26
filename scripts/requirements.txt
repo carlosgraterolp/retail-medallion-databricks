@@ -1,0 +1,3 @@
+# Only needed locally to convert the source .xlsx to CSV (scripts/prepare_data.py)
+pandas==3.1.1
+openpyxl==3.1.5
