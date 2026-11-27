@@ -2,8 +2,8 @@
 
 Preguntas probables sobre este proyecto, con respuestas cortas basadas en lo que construí.
 Cifras de la última corrida: bronze 1.067.371 filas → silver 1.027.015 + cuarentena 6.209 +
-duplicados 34.147; `fact_sales` 1.027.015; 33/33 checks OK; job completo (5 tareas, con dbt) ~3,5 min en el último deploy por CI.
-Capa dbt: 5 modelos y 38 tests (43/43 OK); RFM 5.939 clientes; 4.738 productos; 3.237 filas día × país.
+duplicados 34.147; `fact_sales` 1.027.015, alcanzados **incrementalmente** en 3 lotes (iguales al full refresh); 36/36 checks OK; job completo (5 tareas, con dbt) ~4,5 min por CI.
+Capa dbt: 7 modelos y 47 tests (54/54 OK); RFM 5.939 clientes; 4.738 productos; 3.237 filas día × país.
 
 ---
 
@@ -254,11 +254,77 @@ huérfana, 3 de 33 checks fallaron y el job quedó FAILED.
   que ejecuta Terraform**, leído en el plan (`data.databricks_current_user`), sin nombres en el código.
   Con account console, lo correcto sería un grupo de lectores a nivel de cuenta.
 
-## 27. ¿Qué mejorarías? (siguientes pasos)
-1. ~~Modelos dbt sobre gold~~, ~~Terraform~~, ~~CI/CD con GitHub Actions~~ (hecho).
-2. Backend remoto para el state de Terraform y `terraform plan` en cada PR.
-3. Un catálogo o workspace separado para dev, para que dev y prod no escriban las mismas tablas.
-4. SCD2 en `dim_customer` (snapshots de dbt) e ingesta incremental real en bronze (Auto Loader).
+## 27. Auto Loader vs COPY INTO vs `spark.read`
+- **`spark.read`**: lectura batch; lee *todo* lo que hay cada vez. No recuerda qué archivos ya cargó:
+  la idempotencia es problema tuyo (antes hacía overwrite completo de bronze).
+- **COPY INTO** (SQL): idempotente, se salta archivos ya cargados; bueno para cargas batch en SQL.
+  No tiene columna de datos rescatados.
+- **Auto Loader** (`cloudFiles`): Structured Streaming sobre archivos. Guarda en el **checkpoint**
+  qué archivos procesó (exactly-once por archivo), infiere y **evoluciona el esquema**, y manda lo que
+  no encaja a **`_rescued_data`**. Es lo que Databricks recomienda para ingesta incremental desde storage.
+- Usé Auto Loader para dos fuentes: CSV semanales (esquema explícito, todo string) y un catálogo JSON
+  anidado (esquema inferido con evolución).
+
+## 28. Checkpoints, exactly-once e idempotencia
+- **Checkpoint**: carpeta (en un volumen de Unity Catalog, uno por stream) con los offsets/archivos
+  procesados y, en Auto Loader, la ubicación del esquema. Reiniciar el stream continúa donde quedó.
+- **Exactly-once** de punta a punta = fuente rebobinable + checkpoint + sink idempotente. El sink Delta
+  directo lo es (cuarentena). `foreachBatch` solo garantiza **at-least-once**: si un lote se reintenta,
+  se vuelve a escribir. Por eso dentro de `foreachBatch` hago un **`MERGE` solo de inserción por
+  `line_id`**: repetir el lote no inserta nada dos veces. Para appends dentro de `foreachBatch` existen
+  `txnAppId` + `txnVersion = batchId`.
+- **Prueba**: una corrida sin archivos nuevos ingirió 0 filas y silver +0; y un check compara el silver
+  incremental con una recomputación completa desde bronze (mismos `line_id`, misma cuarentena, mismo
+  ingreso). Pasó en las 4 corridas.
+- Ojo con los modelos incrementales aguas abajo: si el origen se recarga desde cero, hay que
+  reconstruirlos (me pasó con `mart_daily_sales` en dev).
+
+## 29. `availableNow` vs continuo
+- **`availableNow`**: procesa todo lo pendiente (en varios micro-lotes) y se detiene. Ideal para jobs
+  programados o bajo demanda; es lo único que soporta serverless (además del obsoleto `once`).
+- **Continuo / `processingTime`**: el stream queda corriendo y revisa cada X tiempo; menor latencia,
+  pero cómputo siempre encendido. En serverless da error `INFINITE_STREAMING_TRIGGER_NOT_SUPPORTED`.
+- Mismo código: cambiar el trigger convierte el batch incremental en streaming continuo.
+
+## 30. Change data feed (CDF): ¿lo usaste?
+- CDF registra los cambios fila a fila de una tabla Delta (`insert`, `update_preimage/postimage`,
+  `delete`) para leerlos con `readChangeFeed`.
+- **No lo necesité**: bronze es *append-only*, así que una lectura streaming normal de la tabla Delta
+  basta (el checkpoint guarda qué versiones procesó). Un stream sobre Delta además falla si el origen
+  recibe UPDATE/DELETE/MERGE; ahí sí haría falta CDF. Alternativa descartada: una marca de agua sobre
+  `_ingested_at` (depende de relojes y necesita su propia tabla de estado).
+
+## 31. Evolución de esquema: ¿cómo la manejaste?
+- Modos de Auto Loader: `addNewColumns` (por defecto al inferir), `rescue`, `failOnNewColumns`, `none`.
+- Con `addNewColumns`, al aparecer un campo nuevo (`tags`, lote 3) Auto Loader lo agrega al esquema y
+  **detiene el stream a propósito** (`UnknownFieldException`); al reiniciar, lo ingiere. Configuré
+  **1 reintento automático** en la tarea bronze, como recomienda Databricks. En la corrida 4: intento 1
+  falló, el reintento pasó, el job terminó SUCCESS y CI reportó el resultado final.
+- `mergeSchema` deja que la tabla Delta agregue la columna. En silver emito siempre la columna `tags`
+  (NULL antes del lote 3), así su esquema no cambia.
+- `_rescued_data` guarda lo que no encaja (tipos, mayúsculas, columnas extra) en vez de perderlo.
+  Un bug real: con columna rescatada, Auto Loader compara los **nombres** del header CSV con el
+  esquema; puse nombres en snake_case y *todas* las filas quedaron rescatadas (lo vi en dev).
+
+## 32. Semi-estructurado (JSON) vs relacional vs NoSQL
+- **Relacional**: esquema fijo, filas y columnas, joins; lo que es silver/gold.
+- **Semi-estructurado** (JSON): el esquema viaja con el dato, puede tener estructuras anidadas
+  (structs) y listas (arrays), y cambiar en el tiempo. En el lakehouse se ingiere tal cual a bronze y
+  se **aplana** en silver: structs a columnas (`attributes.category` → `category`) y arrays con
+  `explode` (`price_history` → una fila por precio).
+- **NoSQL** es otra cosa: un tipo de *base de datos* (documentos como MongoDB, clave-valor, columnar
+  ancha, grafos) pensada para operación (OLTP), no para análisis. Aquí no hay base NoSQL: hay archivos
+  JSON procesados con Spark y Delta. Si en la entrevista preguntan por "NoSQL", la conexión honesta es
+  que los documentos JSON que exporta una base documental se ingieren así.
+- El catálogo es **sintético derivado**: nombre y precios salen de las transacciones reales;
+  categoría, estacionalidad y tags son reglas de palabras clave. Por eso `mart_category_performance`
+  demuestra el modelado, pero sus cifras **no** son hallazgos de negocio.
+
+## 33. ¿Qué mejorarías? (siguientes pasos)
+1. ~~dbt~~, ~~Terraform~~, ~~CI/CD~~, ~~ingesta incremental con Auto Loader~~ (hecho).
+2. Gold incremental (hoy se reconstruye desde silver en cada corrida).
+3. Backend remoto para el state de Terraform y `terraform plan` en cada PR.
+4. SCD2 en `dim_customer` (snapshots de dbt) y grupos de cuenta para el acceso de lectura.
 
 ## Preguntas trampa
 - *"¿Por qué hay 22% de ventas sin cliente y no las eliminaste?"*: son ventas reales (compras como

@@ -3,8 +3,9 @@
 [![CI](https://github.com/carlosgraterolp/retail-medallion-databricks/actions/workflows/ci.yml/badge.svg)](https://github.com/carlosgraterolp/retail-medallion-databricks/actions/workflows/ci.yml)
 [![Deploy](https://github.com/carlosgraterolp/retail-medallion-databricks/actions/workflows/deploy.yml/badge.svg?branch=main)](https://github.com/carlosgraterolp/retail-medallion-databricks/actions/workflows/deploy.yml)
 
-An end-to-end batch pipeline on **Databricks Free Edition** that takes ~1.07M real e-commerce
-invoice lines through a **Medallion architecture** (bronze → silver → gold), models the gold layer
+An end-to-end pipeline on **Databricks Free Edition** that ingests ~1.07M real e-commerce invoice
+lines **incrementally with Auto Loader** (plus a semi-structured JSON product catalog with schema
+evolution) through a **Medallion architecture** (bronze → silver → gold), models the gold layer
 as a **Kimball star schema**, validates it with automated **data quality checks**, builds
 business-facing **dbt marts** (customer RFM segments, product Pareto, an incremental daily mart) on
 top of it, and serves a small **AI/BI dashboard**. Platform resources are managed with
@@ -32,17 +33,17 @@ rejected row can be accounted for.
 
 ```mermaid
 flowchart LR
-    A["UCI Online Retail II<br/>(.xlsx, 2 sheets)"] -->|scripts/prepare_data.py<br/>xlsx → CSV, values as text| B["UC Volume<br/>retail_bronze.landing"]
-    B -->|01_bronze| C["Bronze<br/>online_retail_raw<br/>(strings + metadata)"]
-    C -->|02_silver| D["Silver<br/>sales_lines"]
-    C -->|02_silver| Q["Silver<br/>sales_lines_quarantine"]
+    A["UCI Online Retail II<br/>(.xlsx, 2 sheets)"] -->|"prepare_data.py + make_landing_batches.py<br/>weekly CSV files + JSON catalog"| B["UC Volume retail_bronze.landing<br/>(batches landed over time)"]
+    B -->|"01_bronze: Auto Loader<br/>availableNow + checkpoints"| C["Bronze<br/>online_retail_raw (strings)<br/>product_catalog_raw (nested JSON)"]
+    C -->|"02_silver: Delta stream<br/>insert-only MERGE"| D["Silver<br/>sales_lines<br/>product_catalog, product_price_history"]
+    C -->|"02_silver: Delta sink<br/>(exactly-once)"| Q["Silver<br/>sales_lines_quarantine"]
     D -->|03_gold| E["Gold: star schema<br/>fact_sales + 4 dims"]
     E -->|03_gold| F["Gold aggregates"]
     E -->|04_quality_checks| G["dq_check_results<br/>(fails the job on error)"]
     F --> H["AI/BI dashboard"]
     E -->|"dbt (SQL warehouse)"| S["dbt staging views<br/>stg_sales, stg_customers"]
     S --> M["dbt marts (retail_marts)<br/>customer RFM, product performance,<br/>daily sales (incremental)"]
-    M --> T["38 dbt tests + source freshness"]
+    M --> T["47 dbt tests + source freshness"]
 ```
 
 Delivery and infrastructure:
@@ -74,10 +75,11 @@ All of it runs as one Lakeflow Job with five serverless tasks:
 | Marts (dbt) | `mart_customer_rfm` / `mart_product_performance` / `mart_daily_sales` | 5,939 / 4,738 / 3,237 |
 
 `bronze = silver + quarantine + duplicates` (1,027,015 + 6,209 + 34,147 = 1,067,371) is asserted on
-every run. **33 of 33** quality checks passed. In the last CI deployment (GitHub Actions, as the
-service principal) the whole workflow took 3 min 34 s: bronze 14 s, silver 19 s, gold 46 s, checks
-30 s, dbt 61 s; in the dbt task, source freshness passes and 43 of 43 dbt nodes pass (5 models and
-38 tests).
+every run, and these totals were reached **incrementally** (see "Incremental ingestion": they are
+identical to the earlier full-refresh pipeline). **36 of 36** quality checks passed, including
+"incremental silver = full recomputation". In the last CI run (GitHub Actions, as the service
+principal, batch 3 with the schema change) the workflow took 4 min 32 s; in the dbt task, source
+freshness passes and **54 of 54** dbt nodes pass (7 models and 47 tests).
 
 ## Tables
 
@@ -86,13 +88,16 @@ All tables are Delta tables in Unity Catalog, catalog `workspace` (the default c
 ### Bronze: `retail_bronze`
 | Table | Grain | Key | Description |
 |---|---|---|---|
-| `online_retail_raw` | one row per source CSV row | none | All 8 source columns as **strings**, plus `_source_file` and `_ingested_at`. Only the column names are changed (snake_case), because Delta column names cannot contain spaces without column mapping. Full overwrite on every run. |
+| `online_retail_raw` | one row per source CSV row | none | All 8 source columns as **strings**, plus `_rescued_data`, `_source_file` and `_ingested_at`. Only the column names are changed (snake_case), because Delta column names cannot contain spaces without column mapping. **Append-only**, written by Auto Loader. |
+| `product_catalog_raw` | one JSON document | `stock_code` | The nested product catalog as Auto Loader inferred it (structs, arrays), with schema evolution; `tags` appears from catalog batch 3 on. Append-only. |
 
 ### Silver: `retail_silver`
 | Table | Grain | Key | Description |
 |---|---|---|---|
 | `sales_lines` | one invoice line | `line_id` (SHA-256 of all business columns) | Typed, trimmed, upper-cased codes, valid and deduplicated. Flags: `is_cancelled`, `is_guest`, `is_non_merchandise`. `line_amount = quantity × unit_price` (negative for cancellations). |
 | `sales_lines_quarantine` | one rejected source row | none | Every row that failed at least one rule, with the array `failed_rules` and `_quarantined_at`. |
+| `product_catalog` | one merchandise product | `stock_code` | Flattened catalog (structs to columns). `category`, `is_seasonal` and `tags` are **synthetic** (keyword rules); name and prices come from the real transactions. |
+| `product_price_history` | product × price | `stock_code`, `valid_from` | The JSON `price_history` array exploded: one row per distinct price and the date it was first seen. |
 
 ### Gold: `retail_gold` (star schema)
 | Table | Grain | Keys | Description |
@@ -130,17 +135,21 @@ The counts overlap (one row can fail several rules); 6,209 distinct rows are qua
 - **Non-merchandise codes** (POST, DOT, M, BANK CHARGES, AMAZONFEE, gift vouchers…): kept as revenue, flagged, and excluded from the top-products ranking.
 - **Several descriptions per stock code**: `dim_product` keeps the latest non-empty one (SCD1).
 
-### Quality checks (`04_quality_checks`, 33 checks)
+### Quality checks (`04_quality_checks`, 36 checks)
 - Row counts: bronze and silver not empty; silver + quarantine ≤ bronze; fact rows = silver rows.
 - Silver rules enforced: no zero/negative prices, no zero quantity, no cancelled line with positive quantity, `line_id` unique.
 - Null checks on all fact keys; uniqueness of every surrogate and natural key; unknown member present.
 - Referential integrity: no orphan fact rows against any of the four dimensions; only guest lines point to the unknown customer.
 - Revenue reconciliation: silver = fact = monthly-by-country aggregate = cancellation-rate aggregate.
+- **Incremental silver = full recomputation:** silver is rebuilt from the whole bronze table in one
+  batch with the same rules (`silver_rules`) and compared row by row (no `line_id` missing or extra),
+  plus quarantine count and revenue.
+- Product catalog: `stock_code` unique; every price history row points to a catalog product.
 
 Results are appended to `dq_check_results`. If any check fails, the notebook raises an
 `AssertionError` and the job run fails. This was tested by inserting one orphan row into
-`fact_sales`: 3 of 33 checks failed (row count, referential integrity, revenue) and the run was
-marked FAILED. The next full run rebuilt the fact and all checks passed.
+`fact_sales` (when there were 33 checks): 3 of them failed (row count, referential integrity,
+revenue) and the run was marked FAILED. The next full run rebuilt the fact and all checks passed.
 
 ## How to deploy and run
 
@@ -164,11 +173,9 @@ cd terraform && cp terraform.tfvars.example terraform.tfvars   # set your CLI pr
 terraform init && terraform plan && terraform apply && cd ..
 #    The import blocks adopt existing schemas/volume; on a fresh workspace, remove them first.
 
-# 4. Upload the CSVs to the volume (give the full target file name)
-databricks fs mkdir dbfs:/Volumes/workspace/retail_bronze/landing/online_retail_ii -p retail
-for f in data/raw/online_retail_ii_*.csv; do
-  databricks fs cp "$f" "dbfs:/Volumes/workspace/retail_bronze/landing/online_retail_ii/$(basename "$f")" -p retail
-done
+# 4. Prepare the batches (weekly CSVs + JSON catalog) and land the first one (simulated arrival)
+.venv/bin/python scripts/make_landing_batches.py data/raw data/landing
+.venv/bin/python scripts/land_batch.py 1 --profile retail     # later: 2, then 3
 
 # 5. Deploy and run: normally done by GitHub Actions on every push to main (see CI/CD).
 #    By hand, the dev target deploys your own copy, which writes only to the *_dev schemas:
@@ -177,8 +184,7 @@ databricks bundle run -t dev retail_medallion_pipeline -p retail   # or one task
 ```
 
 **Manual alternative (UI only):** after the Terraform step, import the `notebooks/` folder into the
-workspace, upload the two CSVs to `workspace.retail_bronze.landing/online_retail_ii/` in Catalog
-Explorer, then run `01_bronze` → `04_quality_checks` in order (each one runs `00_setup` first, which
+workspace, land a batch with `scripts/land_batch.py`, then run `01_bronze` → `04_quality_checks` in order (each one runs `00_setup` first, which
 checks that the schemas and volume exist).
 
 ## Dashboard
@@ -241,6 +247,8 @@ dbt hangs or fails with `CERTIFICATE_VERIFY_FAILED`, run
 | `mart_customer_rfm` | table | one identified customer (guests excluded) | Who are our best customers, and who are we losing? Recency, frequency, monetary, R/F/M scores 1-5 and a segment |
 | `mart_product_performance` | table | one merchandise product sold | Which products drive revenue? Net revenue, units, invoices, cancellation rate, rank, revenue share, cumulative share and the Pareto flag |
 | `mart_daily_sales` | **incremental** (merge on `sale_date`, `country`) | one day × invoice country | How much did we sell each day and where? Net revenue, invoices, identified customers |
+| `stg_product_catalog` | view | one merchandise product | The flattened JSON catalog; its category, seasonal flag and tags are renamed `synthetic_*` |
+| `mart_category_performance` | table | one **synthetic** category | Demonstrates joining the semi-structured catalog to the star schema. Categories come from keyword rules, so its figures are **not** business findings. |
 
 Only two staging views exist, where they add value (consistent amount definitions; removing the
 unknown member). The other dimensions are read directly as sources.
@@ -256,15 +264,17 @@ F>=3), New (R>=4), Potential loyalist (R=3), At risk (R<=2, F>=3), Lost (the res
 
 ### Tests
 
-38 dbt tests plus a source freshness check:
-- **Generic (34):** `unique` and `not_null` on every key; `relationships` from `fact_sales` to the four
+47 dbt tests plus a source freshness check:
+- **Generic (42):** `unique` and `not_null` on every key; `relationships` from `fact_sales` to the four
   dimensions and from the marts to their parents; `accepted_values` on the RFM segment and `r_score`;
-  `not_null` on scores for scored customers (`where segment <> 'No net value'`).
-- **Singular (4):** `assert_daily_sales_reconciles_with_fact` (net revenue of the daily mart equals
+  `not_null` on scores for scored customers (`where segment <> 'No net value'`); `unique` and
+  `accepted_values` on the catalog and the synthetic categories.
+- **Singular (5):** `assert_daily_sales_reconciles_with_fact` (net revenue of the daily mart equals
   `fact_sales` to the penny), `assert_every_customer_in_rfm` (every non-guest customer of
   `fact_sales` is in the RFM mart), `assert_no_net_value_segment_rule` (that segment is exactly the
   customers with monetary <= 0, and they have no scores), `assert_pareto_shares_consistent`
-  (revenue shares add up to 100%).
+  (revenue shares add up to 100%), `assert_category_revenue_reconciles` (revenue by synthetic
+  category adds up to the product mart).
 - **Freshness:** `fact_sales._loaded_at`, warn after 7 days (warn only: the pipeline runs on demand).
 
 The singular tests caught two real problems while the marts were built: Spark's `least()` ignores
@@ -301,6 +311,61 @@ run 3, including the reconciliation with `fact_sales`.
 ### Lineage
 
 ![dbt lineage graph](screenshots/dbt_lineage.png)
+
+## Incremental ingestion (Auto Loader)
+
+**Arrival is simulated:** the source is a static file, so `scripts/make_landing_batches.py` splits
+each sheet into **weekly CSV files** (106 files; values unchanged) and builds a **JSON Lines product
+catalog**, and `scripts/land_batch.py` lands them in the landing volume in 3 batches by date. The two
+source sheets stay separate, so their overlapping week still arrives twice, as in the real data.
+
+### Bronze: Auto Loader
+- Two `cloudFiles` streams, each with its **own checkpoint** in the `retail_bronze.checkpoints` volume
+  (Terraform). The checkpoint records every file already ingested, so a file is loaded once.
+- `trigger(availableNow=True)`: process everything new, then stop. It is the only trigger serverless
+  supports (continuous and `processingTime` are not), and it fits a job that runs on demand.
+- Sales CSV: explicit schema with **every column a string** (bronze keeps values as-is) and a
+  **`_rescued_data`** column for anything that does not fit; 0 rows rescued.
+- Product catalog JSON: schema **inferred** (`inferColumnTypes`) and stored in the schema location,
+  `schemaEvolutionMode = addNewColumns`.
+
+### Silver: incremental and idempotent
+- Bronze is append-only, so silver reads it as a **Delta streaming source** with its own checkpoint.
+  Change data feed was not needed (it matters when the source has updates or deletes), and a
+  watermark on `_ingested_at` would depend on clocks and need its own state table.
+- Valid lines: `foreachBatch` deduplicates the micro-batch and runs an **insert-only `MERGE` on
+  `line_id`**. `foreachBatch` is at-least-once, so a replayed batch must be harmless: it inserts
+  nothing twice, and a line that already arrived from another file is skipped (cross-batch dedup).
+- Quarantine: a plain Delta sink, which commits each micro-batch exactly once per checkpoint.
+- Catalog: structs flattened to columns and `price_history` exploded, both `MERGE`d on natural keys.
+- Gold and dbt are unchanged: gold is rebuilt from silver on each run, and dbt's daily mart stays
+  incremental.
+
+### Schema evolution
+Catalog batch 3 adds a new field, `tags`. With `addNewColumns`, Auto Loader records the new column
+and **deliberately stops the stream** with `UnknownFieldException`; the bronze task has
+`max_retries: 1`, and the retry ingests the file with the evolved schema (`mergeSchema` lets the
+Delta table add the column). Silver always emits a `tags` column (NULL before batch 3), so its
+schema does not change. The job result is SUCCESS, and CI reports the final attempt.
+
+### Proof: run sequence in prod (GitHub Actions, as `github-ci`)
+
+| Run | What landed | New bronze rows (sales + JSON docs) | Bronze / silver / quarantine / duplicates | Checks | dbt |
+|---|---|---|---|---|---|
+| 1 | batch 1 (30 weekly files + catalog) | 260,642 + 3,721 | 260,642 / 255,240 / 2,323 / 3,079 | 36/36 | 54/54 |
+| 2 | batch 2 (40 files + catalog) | 408,894 + 438 | 669,536 / 634,837 / 4,497 / 30,202 | 36/36 | 54/54 |
+| 3 | nothing new | **0 + 0** | unchanged | 36/36 | 54/54 |
+| 4 | batch 3 (36 files + catalog with new field `tags`) | 397,835 + 565 | **1,067,371 / 1,027,015 / 6,209 / 34,147** | 36/36 | 54/54 |
+
+In run 4, bronze attempt 1 stopped with `UNKNOWN_FIELD_EXCEPTION.NEW_FIELDS_IN_RECORD_WITH_FILE_PATH`
+and the automatic retry succeeded; the job ended `TERMINATED SUCCESS`. The final totals and revenue
+(£19,002,774.21) equal the full-refresh pipeline exactly, and the incremental = full recomputation
+check passed on every run.
+
+**Before the first incremental run**, the full-refresh tables were dropped so the streams started
+from an empty state, including dbt's incremental `mart_daily_sales`: an incremental model assumes its
+upstream only grows, and a stale copy built from the old full table made the reconciliation test
+fail in a dev run.
 
 ## Infrastructure as code
 
@@ -381,7 +446,7 @@ the better design: access would belong to a role, not to one person.
 | Workflow | Trigger | What it does |
 |---|---|---|
 | [`ci.yml`](.github/workflows/ci.yml) | pull request to `main` | `ruff check`; `terraform fmt -check` and `validate`; `dbt parse`; `databricks bundle validate --strict -t prod`. Never deploys. |
-| [`deploy.yml`](.github/workflows/deploy.yml) | push to `main`, manual run | `bundle validate`, `bundle deploy -t prod` (job and dashboard), `bundle run` of the job. **Fails if any task fails**, including the 33 quality checks and `dbt build`; writes a run summary (task, state, duration, row counts, `checks=33 passed=33`, dbt `PASS=43`). One deployment at a time. |
+| [`deploy.yml`](.github/workflows/deploy.yml) | push to `main`, manual run | `bundle validate`, `bundle deploy -t prod` (job and dashboard), `bundle run` of the job. **Fails if the job fails**, including the 36 quality checks and `dbt build`; a task that succeeds on its automatic retry counts as succeeded, like the job. Writes a run summary (task, final state, retries and why, duration, row counts, `checks=36 passed=36`, dbt `PASS=54`). One deployment at a time. |
 
 - **Authentication:** OAuth M2M as the `github-ci` service principal. Its client ID and secret, the
   workspace host and the workspace ID are GitHub Actions secrets; nothing secret is in the repo.
@@ -453,9 +518,13 @@ Databricks also deletes a secret that is not used for 90 days. To rotate it befo
 
 ## Limitations (what this project is not)
 
-- The Spark layers are full refresh: bronze, silver and the fact are rebuilt on every run, with no
-  streaming. Only the dbt daily mart is incremental, and its "new data" is simulated with a cutoff
-  variable because the source is static.
+- New data is **simulated**: the source is static, so files are prepared from it and landed in
+  batches. Bronze and silver are incremental; gold is still rebuilt from silver on every run, which
+  is fine at this size but would be the next thing to make incremental.
+- Auto Loader runs in directory-listing mode with `availableNow` (no file notifications, no
+  continuous processing), which is what Free Edition serverless supports.
+- The product catalog's category, seasonal flag and tags are synthetic (keyword rules), not real
+  merchandising data.
 - Dimensions are still SCD Type 1 only; no attribute history (RFM uses each customer's latest country).
 - One workspace and one catalog (Free Edition): `dev` is isolated by schema (`retail_*_dev`), not by
   catalog or workspace. Both environments read the same landing volume (read-only).
